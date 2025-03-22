@@ -26,6 +26,9 @@ import sys
 import tabula
 import random
 
+# 디버그 모드 설정
+DEBUG_MODE = False
+
 # OLLAMA_AVAILABLE 변수 정의
 OLLAMA_AVAILABLE = False
 
