@@ -806,6 +806,7 @@ class RAGSystem:
         
         # 응답 캐시 초기화
         self._cache = {}
+        self.cache_file = os.path.join(SCRIPT_DIR, "cache.json")
         
         # 항상 BGE-M3 임베딩 사용
         self.embedding_type = "bge-m3"
@@ -875,9 +876,8 @@ class RAGSystem:
             return {}
     
     def _save_cache(self):
-        cache_file = os.path.join(SCRIPT_DIR, "cache.json")
         try:
-            with open(cache_file, 'w', encoding='utf-8') as f:
+            with open(self.cache_file, 'w', encoding='utf-8') as f:
                 # self._cache로 저장하도록 수정
                 json.dump(self._cache, f, ensure_ascii=False, indent=2)
             # 그리고 동기화를 위해 self.cache도 업데이트
