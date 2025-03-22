@@ -290,15 +290,20 @@ class PDFProcessor:
             return ''
     
     def _save_current_hash(self):
-        """현재 PDF 해시 값 저장"""
-        hash_file = os.path.join(os.path.dirname(self.pdf_path), "pdf_hash.txt")
+        """현재 PDF 해시값을 JSON 파일에 저장합니다."""
         try:
-            os.makedirs(os.path.dirname(hash_file), exist_ok=True)
-            with open(hash_file, 'w', encoding='utf-8') as f:
-                f.write(self.pdf_hash)
-            print(f"✓ 현재 PDF 해시 저장 완료: {hash_file}")
+            os.makedirs(os.path.dirname(self.hash_file), exist_ok=True)
+            data = {
+                'pdf_hash': self.pdf_hash,
+                'pdf_path': self.pdf_path,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+            with open(self.hash_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"✓ 현재 PDF 해시 저장 완료: {self.hash_file}")
         except Exception as e:
             print(f"⚠️ 현재 해시 저장 중 오류: {e}")
+            logger.error(f"현재 해시 저장 중 오류: {e}")
     
     def needs_processing(self) -> bool:
         """PDF가 새로운 데이터인지 확인합니다."""
