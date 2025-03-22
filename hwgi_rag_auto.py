@@ -801,6 +801,9 @@ class RAGSystem:
     def __init__(self, embedding_type: str = "bge-m3", use_hnsw: bool = True, ef_search: int = 200, ef_construction: int = 200, m: int = 64):
         print("🔧 RAG 시스템 초기화 중...")
         
+        # 응답 캐시 초기화
+        self._cache = {}
+        
         # 항상 BGE-M3 임베딩 사용
         self.embedding_type = "bge-m3"
         self.model_config = EMBEDDING_MODELS["bge-m3"]
@@ -825,10 +828,13 @@ class RAGSystem:
         # 캐시 초기화 시도
         try:
             self.cache = self._load_cache()
+            # 기존 캐시를 _cache에도 복사
+            self._cache = self.cache.copy()
         except Exception as e:
             logger.warning(f"캐시 로드 중 오류 발생: {e}")
             print(f"⚠️ 캐시 파일 로드 실패, 새로운 캐시를 생성합니다")
             self.cache = {}
+            self._cache = {}
             self._save_cache()  # 새로운 빈 캐시 파일 생성
         
         self.qa_prompt = """당신은 한화손해보험 사업보고서 내용을 분석하고 정확한 정보를 제공하는 금융 전문가입니다.
@@ -853,37 +859,29 @@ class RAGSystem:
 [답변]
 (위 정보들을 바탕으로 3-4문장으로 답변)"""
         print("✅ RAG 시스템 초기화 완료")
-        
+    
     def _load_cache(self) -> Dict[str, str]:
-        """캐시 파일을 안전하게 로드합니다."""
+        """캐시된 응답을 로드합니다."""
         try:
-            cache_file = os.path.join(SCRIPT_DIR, "cache.json")
-            if os.path.exists(cache_file):
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                    if not content:  # 파일이 비어있는 경우
-                        return {}
-                    return json.loads(content)
-            return {}
-        except json.JSONDecodeError as e:
-            logger.error(f"손상된 캐시 파일 감지: {e}")
-            # 손상된 캐시 파일 백업
-            if os.path.exists(cache_file):
-                backup_file = f"{cache_file}.bak"
-                try:
-                    os.rename(cache_file, backup_file)
-                    logger.info(f"손상된 캐시 파일을 {backup_file}로 백업했습니다")
-                except Exception as be:
-                    logger.error(f"캐시 파일 백업 실패: {be}")
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
             return {}
         except Exception as e:
-            logger.error(f"캐시 로드 중 예상치 못한 오류: {e}")
+            logger.error(f"캐시 로드 중 오류: {e}")
             return {}
     
     def _save_cache(self):
         cache_file = os.path.join(SCRIPT_DIR, "cache.json")
-        with open(cache_file, 'w', encoding='utf-8') as f:
-            json.dump(self.cache, f, ensure_ascii=False, indent=2)
+        try:
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                # self._cache로 저장하도록 수정
+                json.dump(self._cache, f, ensure_ascii=False, indent=2)
+            # 그리고 동기화를 위해 self.cache도 업데이트
+            self.cache = self._cache.copy()
+        except Exception as e:
+            logger.error(f"캐시 저장 중 오류: {e}")
+            print(f"⚠️ 캐시 저장 중 오류: {e}")
     
     def _save_document_metadata(self, documents: List[Document], metadata_file: str):
         metadata = {
