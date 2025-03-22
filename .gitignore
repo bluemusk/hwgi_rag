@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 환경 변수 파일
+.env
+.venv
+env/
+venv/
+ENV/
+
+# 가상환경
+blogWriter/
+
+# IDE 관련 파일
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 로그 및 임시 파일
+Log/
+*.log
+logs/
+tmp/
+temp/
+
+# 데이터 및 인덱스 파일
+faiss_index/
+Index/
+*.index
+*.pkl
+*.bin
+*.vec
+*.npy
+*.h5
+faiss_metadata.json
+pdf_hash.txt
+
+# 결과 파일
+query_results/
+model_evaluations.json
+
+# PDF 파일 (필요시 주석 처리)
+*.pdf
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# OS 파일
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db 
