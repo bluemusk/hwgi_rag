@@ -1033,8 +1033,14 @@ class RAGSystem:
             return self._create_new_vector_store(documents)
         return True
     
-    def _create_new_vector_store(self, documents, hnsw_space='l2'):
+    def _create_new_vector_store(self, documents, hnsw_space='cosine'):
         """문서 임베딩 및 벡터 저장소 생성"""
+        # 필요한 모듈 가져오기
+        from langchain.vectorstores import FAISS
+        import numpy as np
+        import faiss
+        import uuid
+        
         print(f"\n{'─'*60}")
         print(f"📊 벡터 저장소 생성 중... ")
         print(f"{'─'*60}")
@@ -1060,7 +1066,6 @@ class RAGSystem:
                     return None
                 
                 # 벡터 저장소 생성
-                from langchain.vectorstores import FAISS
                 vector_store = FAISS(
                     embedding_function=self.embeddings,
                     index=empty_index,
@@ -1163,9 +1168,7 @@ class RAGSystem:
                             embeddings_list = self.embeddings.embed_documents(texts)
                             
                             # 빈 인덱스 생성
-                            import numpy as np
-                            import faiss
-                            import uuid
+                            # 앞서 임포트했으므로 중복 제거
                             
                             # 벡터 임베딩으로 인덱스 생성
                             index = faiss.IndexFlatL2(embedding_dim)
