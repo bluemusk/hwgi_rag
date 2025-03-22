@@ -616,7 +616,7 @@ class PDFProcessor:
             print(f"❌ 표 시각화 중 오류 발생: {e}")
 
 class DocumentSplitter:
-    def __init__(self, chunk_size=500, chunk_overlap=150):  # 청크 사이즈 축소 (800 → 500), 겹침 비율 30% 유지
+    def __init__(self, chunk_size=800, chunk_overlap=200):  # 청크 사이즈 증가 (500 → 800), 겹침 크기 증가 (150 → 200)
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.text_splitter = RecursiveCharacterTextSplitter(
