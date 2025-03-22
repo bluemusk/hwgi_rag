@@ -657,55 +657,7 @@ class QueryExpander:
     def __init__(self, models: List[str] = AVAILABLE_MODELS):
         self.models = models
         logger.info(f"QueryExpander 초기화: 모델={', '.join(models)}")
-        self.prompt_template = """당신은 한화손해보험 사업보고서 PDF 문서를 검색하는 시스템입니다.
-주어진 원래 질문을 기반으로 사업보고서 내용을 효과적으로 검색하기 위한 3개의 변형 쿼리를 생성해주세요.
-
-각 변형 쿼리는 다음 특성을 가져야 합니다:
-1. 금융/보험 용어 중심: 원래 질문에서 금융, 보험, 재무와 관련된 핵심 키워드를 추출하여 구성
-2. 사업보고서 맥락: 사업보고서에서 찾을 수 있는 정보(재무상태, 경영실적, 사업전략, 리스크, 지배구조 등)에 맞게 변형
-3. 구체적인 정보 지향: 숫자, 비율, 금액, 날짜 등 구체적인 정보를 찾기 위한 표현 포함
-
-예시:
-- 원래 질문: "한화손해보험의 순이익은?"
-  변형1: "한화손해보험 당기순이익 금액"
-  변형2: "한화손해보험 영업이익 재무제표"
-  변형3: "한화손해보험 수익 실적 연도별"
-
-- 원래 질문: "한화손해보험의 주요 사업은?"
-  변형1: "한화손해보험 주력 보험상품 종류"
-  변형2: "한화손해보험 사업분야 매출 비중"
-  변형3: "한화손해보험 핵심사업 전략 방향"
-
-반드시 아래 형식의 유효한 JSON 배열로만 응답하며, 추가 설명이나 주석은 절대 포함시키지 마세요:
-["변형1", "변형2", "변형3"]
-
-원래 질문: {query}"""
-    
-    def _generate_with_ollama(self, prompt: str, model: str) -> str:
-        if DEBUG_MODE:
-            print(f"\n📝 쿼리 확장 - Ollama API 호출 중 ({model})")
-        start_time = time.time()
-        try:
-            response = requests.post(
-                f"{OLLAMA_API_BASE}/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.5, "top_p": 0.95, "num_predict": 500}  # 온도 낮춤 (0.7 → 0.5)
-                }
-            )
-            response.raise_for_status()
-            result = response.json().get("response", "")
-            elapsed_time = time.time() - start_time
-            if DEBUG_MODE:
-                print(f"✓ 완료 ({elapsed_time:.2f}초)")
-            return result
-        except Exception as e:
-            logger.error(f"❌ Ollama API 호출 중 오류: {e}")
-            if DEBUG_MODE:
-                print(f"❌ Ollama API 호출 실패: {e}")
-            return ""
+        # 프롬프트 템플릿을 여기서 정의하지 않고 _generate_expansion_prompt에서만 정의
     
     def _generate_expansion_prompt(self, query: str) -> str:
         """쿼리 확장을 위한 프롬프트를 생성합니다."""
@@ -820,6 +772,33 @@ class QueryExpander:
         print(f"\n✅ 전체 확장 완료: {len(all_queries)}개의 고유 쿼리 생성됨")
         sys.stdout.flush()  # 버퍼 비우기
         return all_queries
+    
+    def _generate_with_ollama(self, prompt: str, model: str) -> str:
+        """Ollama API를 통해 쿼리 확장 생성"""
+        if DEBUG_MODE:
+            print(f"\n📝 쿼리 확장 - Ollama API 호출 중 ({model})")
+        start_time = time.time()
+        try:
+            response = requests.post(
+                f"{OLLAMA_API_BASE}/generate",
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.5, "top_p": 0.95, "num_predict": 500}  # 온도 낮춤 (0.7 → 0.5)
+                }
+            )
+            response.raise_for_status()
+            result = response.json().get("response", "")
+            elapsed_time = time.time() - start_time
+            if DEBUG_MODE:
+                print(f"✓ 완료 ({elapsed_time:.2f}초)")
+            return result
+        except Exception as e:
+            logger.error(f"❌ Ollama API 호출 중 오류: {e}")
+            if DEBUG_MODE:
+                print(f"❌ Ollama API 호출 실패: {e}")
+            return ""
 
 # --- RAG 시스템 (벡터 검색) ---
 class RAGSystem:
