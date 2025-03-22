@@ -661,14 +661,21 @@ class QueryExpander:
     
     def _generate_expansion_prompt(self, query: str) -> str:
         """쿼리 확장을 위한 프롬프트를 생성합니다."""
-        return f"""당신은 검색 쿼리 확장 전문가입니다. 주어진 검색 질문을 바탕으로 효과적인 검색을 위한 대체 쿼리를 3-4개 생성해주세요.
+        return f"""당신은 한화손해보험 사업보고서 검색을 위한 쿼리 확장 전문가입니다. 
+주어진 검색 질문을 바탕으로 사업보고서에서 관련 정보를 효과적으로 찾기 위한 대체 쿼리를 3-4개 생성해주세요.
 
 원칙:
-1. 원래 질문의 핵심 의미를 유지하세요
-2. 다양한 표현과 동의어를 사용하세요
-3. 검색이 잘 될만한 키워드와 구문을 포함하세요
+1. 한화손해보험 사업보고서 내용과 관련된 금융, 보험, 재무 용어를 포함하세요
+2. 사업보고서 맥락에 맞는 표현(재무상태, 경영실적, 사업전략, 리스크, 지배구조 등)을 사용하세요
+3. 구체적인 정보(숫자, 비율, 금액, 날짜 등)를 찾기 위한 키워드를 포함하세요
 4. 확장된 각 쿼리는 큰따옴표("")로 감싸서 제공하세요(예: "확장된 쿼리")
 5. 설명이나 추가 텍스트 없이 따옴표 안에 확장된 쿼리만 작성하세요
+
+예시:
+- 원래 질문: "한화손해보험의 순이익은?"
+  1. "한화손해보험 당기순이익 금액"
+  2. "한화손해보험 영업이익 재무제표"
+  3. "한화손해보험 수익 실적 연도별"
 
 형식:
 1. "첫 번째 대체 쿼리"
@@ -738,7 +745,12 @@ class QueryExpander:
                                 clean_line = quoted_text.group(1).strip()
                                 
                         if clean_line and len(clean_line) > 5 and '이 쿼리는' not in clean_line and '이 쿼리들은' not in clean_line:
-                            new_queries.append(clean_line)
+                            # 한화손해보험과 관련된 내용인지 확인
+                            if ('한화' in clean_line.lower() or '손해보험' in clean_line.lower() or
+                                '재무' in clean_line.lower() or '보험' in clean_line.lower() or
+                                '사업' in clean_line.lower() or '경영' in clean_line.lower() or
+                                '실적' in clean_line.lower() or '전략' in clean_line.lower()):
+                                new_queries.append(clean_line)
                 
                 # 중복 제거
                 old_count = len(unique_queries)
@@ -769,6 +781,7 @@ class QueryExpander:
             filtered_queries.extend(other_queries[:4])
             all_queries = filtered_queries
         
+        # 성공 메시지 - 여기서만 한 번 출력
         print(f"\n✅ 전체 확장 완료: {len(all_queries)}개의 고유 쿼리 생성됨")
         sys.stdout.flush()  # 버퍼 비우기
         return all_queries
@@ -846,11 +859,11 @@ class RAGSystem:
 사용자의 질문에 대해 제공된 문서 내용을 기반으로 명확하고 사실적인 답변을 작성해주세요.
 
 [지침]
-1. 문서에서 찾은 핵심 정보를 먼저 나열하고, 그 내용을 바탕으로 답변을 작성하세요.
-2. 숫자, 날짜, 금액 등 구체적인 수치는 정확히 인용하세요.
-3. 불확실한 내용은 추측하지 말고 문서에 있는 내용만 사용하세요.
-4. 답변은 3-4문장으로 간단명료하게 작성하세요.
-5. 전문 용어는 가능한 쉽게 설명하세요.
+1. 한화손해보험 사업보고서의 핵심 정보를 먼저 나열하고, 그 내용을 바탕으로 답변을 작성하세요.
+2. 재무제표, 손익계산서, 경영실적 등의 숫자, 날짜, 금액은 정확히 인용하세요.
+3. 보험상품, 리스크 관리, 지배구조 등에 대해 문서에 있는 내용만 사용하고 추측하지 마세요.
+4. 답변은 3-4문장으로 간단명료하게 작성하고 전문 금융용어는 쉽게 설명하세요.
+5. 사업보고서의 분기별/연간 실적 비교 시 정확한 증감률을 명시하세요.
 
 질문: {question}
 
@@ -1242,7 +1255,7 @@ class RAGSystem:
             expanded_queries = [q.strip() for q in expanded_queries if q.strip()]
             expanded_queries = list(dict.fromkeys(expanded_queries))  # 순서 유지하며 중복 제거
             
-            print("✅ 전체 확장 완료: {}개의 고유 쿼리 생성됨".format(len(expanded_queries)))
+            # 여기서 전체 확장 완료 메시지를 출력하지 않음 - 중복 출력 방지
             print("─"*60)
             for i, q in enumerate(expanded_queries, 1):
                 print(f"  {i}. {q}")
