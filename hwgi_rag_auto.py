@@ -895,27 +895,21 @@ class RAGSystem:
             json.dump(metadata, f, ensure_ascii=False, indent=2)
     
     def _generate_with_ollama(self, prompt: str, model: str, stream=False, **params) -> str:
-        print(f"\n🤖 답변 생성 중... ({model})")
+        """Ollama API를 사용하여 텍스트 생성"""
         start_time = time.time()
+        default_params = {"temperature": 0.7, "top_p": 0.9, "num_predict": 2048}
+        default_params.update(params)  # 사용자 제공 매개변수로 기본값 업데이트
         
-        # 기본 파라미터 설정
-        default_params = {
-            "temperature": 0.7,
-            "top_p": 0.9, 
-            "num_predict": 2048
-        }
-        # 사용자 지정 파라미터로 업데이트
-        default_params.update(params)
-        
-        # 1. ollama 라이브러리가 있으면 직접 사용
+        # 1. 가능하면 ollama 라이브러리 사용
         if OLLAMA_AVAILABLE:
             try:
                 if stream:
                     # 스트리밍 모드
-                    print("\n응답: ", end="", flush=True)
+                    print("\n응답: ", end="")
+                    sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                     full_result = ""
                     
-                    # generate API로 스트리밍 호출
+                    # 스트리밍 생성
                     for chunk in ollama.generate(
                         model=model,
                         prompt=prompt,
@@ -924,9 +918,11 @@ class RAGSystem:
                     ):
                         chunk_content = chunk.get("response", "")
                         full_result += chunk_content
-                        print(chunk_content, end="", flush=True)
+                        print(chunk_content, end="")
+                        sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                     
                     print()  # 줄바꿈
+                    sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                     elapsed_time = time.time() - start_time
                     print(f"✓ 스트리밍 답변 생성 완료 (ollama 라이브러리): {model} ({elapsed_time:.2f}초)")
                     return full_result
@@ -948,7 +944,8 @@ class RAGSystem:
         try:
             if stream:
                 # 스트리밍 모드
-                print("\n응답: ", end="", flush=True)
+                print("\n응답: ", end="")
+                sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                 full_result = ""
                 
                 response = requests.post(
@@ -971,11 +968,13 @@ class RAGSystem:
                             chunk_content = json_data.get("response", "")
                             if chunk_content:
                                 full_result += chunk_content
-                                print(chunk_content, end="", flush=True)
+                                print(chunk_content, end="")
+                                sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                         except json.JSONDecodeError:
                             continue
                 
                 print()  # 줄바꿈
+                sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                 elapsed_time = time.time() - start_time
                 print(f"✓ 스트리밍 답변 생성 완료 (REST API): {model} ({elapsed_time:.2f}초)")
                 return full_result
@@ -1331,131 +1330,58 @@ class RAGSystem:
         return "\n\n".join(formatted_docs)
     
     def answer(self, query: str, model: str, context: str) -> Dict[str, Any]:
-        print(f"\n{'─'*60}")
-        print(f"📌 4단계: 답변 생성 ({model})")
-        print(f"{'─'*60}")
+        """쿼리에 대한 답변을 생성합니다."""
+        logger.debug(f"답변 생성 요청 - 쿼리: '{query}', 모델: {model}")
         
-        # 컨텍스트 길이 제한 및 최적화
-        max_context_length = 2000  # 로컬 모델의 한계를 고려한 컨텍스트 길이
-        context_parts = context.split("\n\n")
-        optimized_context = []
-        current_length = 0
+        # 1. 캐시에서 응답 확인
+        cache_key = f"{model}:{hashlib.md5((query + context[:100]).encode()).hexdigest()}"
+        cached_answer = self._load_cache().get(cache_key)
         
-        for part in context_parts:
-            if "[페이지" in part and len(part) + current_length < max_context_length:
-                optimized_context.append(part)
-                current_length += len(part)
+        if cached_answer and not os.environ.get('DISABLE_CACHE'):
+            print(f"💾 캐시된 응답 사용: {model}")
+            return {"answer": cached_answer, "model": model, "cached": True}
         
-        # 최적화된 컨텍스트로 프롬프트 생성
-        optimized_context = "\n\n".join(optimized_context)
-        prompt = self.qa_prompt.format(question=query, context=optimized_context)
-        
-        # 모델별 파라미터 최적화
-        model_params = {
-            "gemma3:1b": {"temperature": 0.3, "top_p": 0.9, "num_predict": 800},
-            "gemma3:4b": {"temperature": 0.3, "top_p": 0.9, "num_predict": 1000},
-            "llama3.1:8b": {"temperature": 0.4, "top_p": 0.9, "num_predict": 800},
-            "gemma3:12b": {"temperature": 0.3, "top_p": 0.9, "num_predict": 1000}
-        }
-        
-        params = model_params.get(model, {"temperature": 0.7, "top_p": 0.95, "num_predict": 2048})
-        
-        # 1. ollama 라이브러리를 사용하여 스트리밍 답변 생성 (있는 경우)
-        if OLLAMA_AVAILABLE:
-            try:
-                print(f"\n🤖 ollama 라이브러리로 스트리밍 답변 생성 중... ({model})")
-                start_time = time.time()
-                
-                # 채팅 형식으로 스트리밍 요청
-                full_answer = ""
-                print("\n응답: ", end="", flush=True)
-                
-                # 스트리밍 응답 처리
-                stream = ollama.chat(
-                    model=model,
-                    messages=[{'role': 'user', 'content': prompt}],
-                    options=params,
-                    stream=True
-                )
-                
-                for chunk in stream:
-                    chunk_content = chunk['message']['content']
-                    full_answer += chunk_content
-                    print(chunk_content, end="", flush=True)
-                
-                print()  # 줄바꿈
-                elapsed_time = time.time() - start_time
-                print(f"\n✓ 스트리밍 답변 생성 완료 (ollama 라이브러리): {model} ({elapsed_time:.2f}초)")
-                return {"answer": full_answer, "model": model}
-            except Exception as e:
-                print(f"\n⚠️ ollama 라이브러리 스트리밍 호출 실패: {e}, REST API로 시도합니다.")
-        
-        # 2. REST API를 통해 스트리밍 답변 생성 (라이브러리가 없거나 실패한 경우)
+        # 2. 프롬프트 생성
         try:
-            print(f"\n🤖 Ollama REST API로 스트리밍 답변 생성 중... ({model})")
-            start_time = time.time()
+            # 오늘 날짜 정보 추가
+            today = datetime.now().strftime("%Y년 %m월 %d일")
             
-            # 스트리밍 요청 설정
-            response = requests.post(
-                f"{OLLAMA_API_BASE}/chat",
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": True,
-                    "options": params
-                },
-                stream=True  # requests의 스트리밍 설정
-            )
-            response.raise_for_status()
+            prompt_template = f"""당신은 한화손해보험의 전문가 AI 어시스턴트입니다.
+주어진 정보를 바탕으로 질문에 정확하고 상세하게 답변해주세요.
+오늘은 {today}입니다.
+
+[정보]
+{context}
+
+[질문]
+{query}
+
+[답변]"""
             
-            full_answer = ""
-            print("\n응답: ", end="", flush=True)
-            
-            # 스트리밍 응답 처리
-            for line in response.iter_lines():
-                if line:
-                    line_text = line.decode('utf-8')
-                    if line_text.startswith('data: '):
-                        try:
-                            json_data = json.loads(line_text[6:])  # 'data: ' 접두사 제거
-                            chunk_content = json_data.get('message', {}).get('content', '')
-                            if chunk_content:
-                                full_answer += chunk_content
-                                print(chunk_content, end="", flush=True)
-                        except json.JSONDecodeError:
-                            continue
-            
-            print()  # 줄바꿈
-            elapsed_time = time.time() - start_time
-            print(f"\n✓ 스트리밍 답변 생성 완료 (REST API): {model} ({elapsed_time:.2f}초)")
-            return {"answer": full_answer, "model": model}
-            
-        except Exception as e:
-            logger.error(f"❌ 스트리밍 답변 생성 중 오류: {e}")
-            print(f"❌ 스트리밍 답변 생성 중 오류 발생: {e}")
-            
-            # 스트리밍 실패 시 일반 요청으로 폴백
+            # 3. Ollama를 사용하여 응답 생성
             try:
-                print(f"\n⚠️ 스트리밍 실패, 일반 요청으로 시도 중...")
-                response = requests.post(
-                    f"{OLLAMA_API_BASE}/generate",
-                    json={
-                        "model": model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": params
-                    }
-                )
-                response.raise_for_status()
-                answer = response.json().get("response", "")
-                elapsed_time = time.time() - start_time
-                print(f"✓ 답변 생성 완료 (REST API): {model} ({elapsed_time:.2f}초)")
-                return {"answer": answer, "model": model}
-            except Exception as e2:
-                logger.error(f"❌ 일반 요청도 실패: {e2}")
-                return {"answer": f"답변 생성 중 오류가 발생했습니다: {str(e)}, 일반 요청도 실패: {str(e2)}", "model": model}
-            
-            return {"answer": f"답변 생성 중 오류가 발생했습니다: {str(e)}", "model": model}
+                # 스트리밍 답변 생성
+                result = self._generate_with_ollama(prompt_template, model, stream=True)
+                
+                # 응답 캐싱
+                answer_content = result if isinstance(result, str) else result.get('answer', '')
+                self._cache[cache_key] = answer_content
+                self._save_cache()
+                
+                # 결과 반환
+                return {
+                    "answer": answer_content,
+                    "model": model,
+                    "cached": False
+                }
+                
+            except Exception as e:
+                logger.error(f"❌ 답변 생성 중 오류: {e}")
+                return {"answer": f"답변을 생성하는 중 오류가 발생했습니다: {str(e)}", "model": model, "error": True}
+                
+        except Exception as e:
+            logger.error(f"❌ 프롬프트 생성 중 오류: {e}")
+            return {"answer": f"답변을 준비하는 중 오류가 발생했습니다: {str(e)}", "model": model, "error": True}
 
 def main():
     # global 선언을 함수 시작 부분으로 이동
@@ -2328,7 +2254,8 @@ class AutoEvaluator:
             try:
                 if stream:
                     # 스트리밍 모드
-                    print("\n평가 응답: ", end="", flush=True)
+                    print("\n평가 응답: ", end="")
+                    sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                     full_result = ""
                     
                     # 스트리밍 생성
@@ -2340,9 +2267,11 @@ class AutoEvaluator:
                     ):
                         chunk_content = chunk.get("response", "")
                         full_result += chunk_content
-                        print(chunk_content, end="", flush=True)
+                        print(chunk_content, end="")
+                        sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                     
                     print()  # 줄바꿈
+                    sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                     elapsed_time = time.time() - start_time
                     print(f"✓ 평가 생성 완료 ({elapsed_time:.2f}초)")
                     return full_result
@@ -2364,7 +2293,7 @@ class AutoEvaluator:
         try:
             if stream:
                 # 스트리밍 모드
-                print("\n평가 응답: ", end="", flush=True)
+                print("\n평가 응답: ", end="")
                 full_result = ""
                 
                 response = requests.post(
@@ -2387,11 +2316,13 @@ class AutoEvaluator:
                             chunk_content = json_data.get("response", "")
                             if chunk_content:
                                 full_result += chunk_content
-                                print(chunk_content, end="", flush=True)
+                                print(chunk_content, end="")
+                                sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                         except json.JSONDecodeError:
                             continue
                 
                 print()  # 줄바꿈
+                sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                 elapsed_time = time.time() - start_time
                 print(f"✓ 스트리밍 평가 생성 완료 ({elapsed_time:.2f}초)")
                 return full_result
@@ -2491,7 +2422,7 @@ class AutoQuestionGenerator:
 다음 형식으로 JSON 배열만 출력하세요:
 ["질문1", "질문2", "질문3", "질문4", "질문5"]"""
 
-    def _generate_with_ollama(self, prompt: str, stream: bool = True) -> str:
+    def _generate_with_ollama(self, prompt: str, stream=False) -> str:
         """Ollama API를 통해 질문 생성"""
         print(f"\n🤖 자동 질문 생성 중... ({self.model_name})")
         start_time = time.time()
@@ -2501,7 +2432,8 @@ class AutoQuestionGenerator:
             try:
                 if stream:
                     # 스트리밍 모드
-                    print("\n질문 생성 응답: ", end="", flush=True)
+                    print("\n질문 생성 응답: ", end="")
+                    sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                     full_result = ""
                     
                     # 스트리밍 생성
@@ -2513,9 +2445,11 @@ class AutoQuestionGenerator:
                     ):
                         chunk_content = chunk.get("response", "")
                         full_result += chunk_content
-                        print(chunk_content, end="", flush=True)
+                        print(chunk_content, end="")
+                        sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                     
                     print()  # 줄바꿈
+                    sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                     elapsed_time = time.time() - start_time
                     print(f"✓ 질문 생성 완료 ({elapsed_time:.2f}초)")
                     return full_result
@@ -2537,7 +2471,7 @@ class AutoQuestionGenerator:
         try:
             if stream:
                 # 스트리밍 모드
-                print("\n질문 생성 응답: ", end="", flush=True)
+                print("\n질문 생성 응답: ", end="")
                 full_result = ""
                 
                 response = requests.post(
@@ -2560,11 +2494,13 @@ class AutoQuestionGenerator:
                             chunk_content = json_data.get("response", "")
                             if chunk_content:
                                 full_result += chunk_content
-                                print(chunk_content, end="", flush=True)
+                                print(chunk_content, end="")
+                                sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                         except json.JSONDecodeError:
                             continue
                 
                 print()  # 줄바꿈
+                sys.stdout.flush()  # 출력 버퍼 즉시 비우기
                 elapsed_time = time.time() - start_time
                 print(f"✓ 스트리밍 질문 생성 완료 ({elapsed_time:.2f}초)")
                 return full_result
