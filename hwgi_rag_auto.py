@@ -24,6 +24,7 @@ from datetime import datetime
 import glob
 import sys
 import tabula
+import random
 
 # OLLAMA_AVAILABLE 변수 정의
 OLLAMA_AVAILABLE = False
@@ -888,7 +889,7 @@ class RAGSystem:
         with open(metadata_file, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, ensure_ascii=False, indent=2)
     
-    def _generate_with_ollama(self, prompt: str, model: str, **params) -> str:
+    def _generate_with_ollama(self, prompt: str, model: str, stream=False, **params) -> str:
         print(f"\n🤖 답변 생성 중... ({model})")
         start_time = time.time()
         
@@ -904,34 +905,91 @@ class RAGSystem:
         # 1. ollama 라이브러리가 있으면 직접 사용
         if OLLAMA_AVAILABLE:
             try:
-                response = ollama.generate(
-                    model=model,
-                    prompt=prompt,
-                    options=default_params
-                )
-                result = response.get("response", "")
-                elapsed_time = time.time() - start_time
-                print(f"✓ 답변 생성 완료 (ollama 라이브러리): {model} ({elapsed_time:.2f}초)")
-                return result
+                if stream:
+                    # 스트리밍 모드
+                    print("\n응답: ", end="", flush=True)
+                    full_result = ""
+                    
+                    # generate API로 스트리밍 호출
+                    for chunk in ollama.generate(
+                        model=model,
+                        prompt=prompt,
+                        options=default_params,
+                        stream=True
+                    ):
+                        chunk_content = chunk.get("response", "")
+                        full_result += chunk_content
+                        print(chunk_content, end="", flush=True)
+                    
+                    print()  # 줄바꿈
+                    elapsed_time = time.time() - start_time
+                    print(f"✓ 스트리밍 답변 생성 완료 (ollama 라이브러리): {model} ({elapsed_time:.2f}초)")
+                    return full_result
+                else:
+                    # 일반 모드
+                    response = ollama.generate(
+                        model=model,
+                        prompt=prompt,
+                        options=default_params
+                    )
+                    result = response.get("response", "")
+                    elapsed_time = time.time() - start_time
+                    print(f"✓ 답변 생성 완료 (ollama 라이브러리): {model} ({elapsed_time:.2f}초)")
+                    return result
             except Exception as e:
                 print(f"⚠️ ollama 라이브러리 호출 실패: {e}, REST API로 시도합니다.")
         
         # 2. 실패하면 REST API 사용
         try:
-            response = requests.post(
-                f"{OLLAMA_API_BASE}/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": default_params
-                }
-            )
-            response.raise_for_status()
-            result = response.json().get("response", "")
-            elapsed_time = time.time() - start_time
-            print(f"✓ 답변 생성 완료 (REST API): {model} ({elapsed_time:.2f}초)")
-            return result
+            if stream:
+                # 스트리밍 모드
+                print("\n응답: ", end="", flush=True)
+                full_result = ""
+                
+                response = requests.post(
+                    f"{OLLAMA_API_BASE}/generate",
+                    json={
+                        "model": model,
+                        "prompt": prompt,
+                        "stream": True,
+                        "options": default_params
+                    },
+                    stream=True
+                )
+                response.raise_for_status()
+                
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            line_text = line.decode('utf-8')
+                            json_data = json.loads(line_text)
+                            chunk_content = json_data.get("response", "")
+                            if chunk_content:
+                                full_result += chunk_content
+                                print(chunk_content, end="", flush=True)
+                        except json.JSONDecodeError:
+                            continue
+                
+                print()  # 줄바꿈
+                elapsed_time = time.time() - start_time
+                print(f"✓ 스트리밍 답변 생성 완료 (REST API): {model} ({elapsed_time:.2f}초)")
+                return full_result
+            else:
+                # 일반 모드
+                response = requests.post(
+                    f"{OLLAMA_API_BASE}/generate",
+                    json={
+                        "model": model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": default_params
+                    }
+                )
+                response.raise_for_status()
+                result = response.json().get("response", "")
+                elapsed_time = time.time() - start_time
+                print(f"✓ 답변 생성 완료 (REST API): {model} ({elapsed_time:.2f}초)")
+                return result
         except Exception as e:
             logger.error(f"❌ Ollama API 호출 중 오류 (모델: {model}): {e}")
             print(f"❌ Ollama API 호출 실패 (모델: {model}): {e}")
@@ -1297,47 +1355,101 @@ class RAGSystem:
         
         params = model_params.get(model, {"temperature": 0.7, "top_p": 0.95, "num_predict": 2048})
         
-        # 1. ollama 라이브러리를 사용하여 답변 생성 (있는 경우)
+        # 1. ollama 라이브러리를 사용하여 스트리밍 답변 생성 (있는 경우)
         if OLLAMA_AVAILABLE:
             try:
-                print(f"\n🤖 ollama 라이브러리로 답변 생성 중... ({model})")
+                print(f"\n🤖 ollama 라이브러리로 스트리밍 답변 생성 중... ({model})")
                 start_time = time.time()
                 
-                # 채팅 형식으로 요청
-                response = ollama.chat(
+                # 채팅 형식으로 스트리밍 요청
+                full_answer = ""
+                print("\n응답: ", end="", flush=True)
+                
+                # 스트리밍 응답 처리
+                stream = ollama.chat(
                     model=model,
                     messages=[{'role': 'user', 'content': prompt}],
-                    options=params
+                    options=params,
+                    stream=True
                 )
                 
-                answer = response['message']['content']
+                for chunk in stream:
+                    chunk_content = chunk['message']['content']
+                    full_answer += chunk_content
+                    print(chunk_content, end="", flush=True)
+                
+                print()  # 줄바꿈
                 elapsed_time = time.time() - start_time
-                print(f"✓ 답변 생성 완료 (ollama 라이브러리): {model} ({elapsed_time:.2f}초)")
-                return {"answer": answer, "model": model}
+                print(f"\n✓ 스트리밍 답변 생성 완료 (ollama 라이브러리): {model} ({elapsed_time:.2f}초)")
+                return {"answer": full_answer, "model": model}
             except Exception as e:
-                print(f"⚠️ ollama 라이브러리 호출 실패: {e}, REST API로 시도합니다.")
+                print(f"\n⚠️ ollama 라이브러리 스트리밍 호출 실패: {e}, REST API로 시도합니다.")
         
-        # 2. REST API를 통해 답변 생성 (라이브러리가 없거나 실패한 경우)
+        # 2. REST API를 통해 스트리밍 답변 생성 (라이브러리가 없거나 실패한 경우)
         try:
-            print(f"\n🤖 Ollama REST API로 답변 생성 중... ({model})")
+            print(f"\n🤖 Ollama REST API로 스트리밍 답변 생성 중... ({model})")
             start_time = time.time()
+            
+            # 스트리밍 요청 설정
             response = requests.post(
-                f"{OLLAMA_API_BASE}/generate",
+                f"{OLLAMA_API_BASE}/chat",
                 json={
                     "model": model,
-                    "prompt": prompt,
-                    "stream": False,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": True,
                     "options": params
-                }
+                },
+                stream=True  # requests의 스트리밍 설정
             )
             response.raise_for_status()
-            answer = response.json().get("response", "")
+            
+            full_answer = ""
+            print("\n응답: ", end="", flush=True)
+            
+            # 스트리밍 응답 처리
+            for line in response.iter_lines():
+                if line:
+                    line_text = line.decode('utf-8')
+                    if line_text.startswith('data: '):
+                        try:
+                            json_data = json.loads(line_text[6:])  # 'data: ' 접두사 제거
+                            chunk_content = json_data.get('message', {}).get('content', '')
+                            if chunk_content:
+                                full_answer += chunk_content
+                                print(chunk_content, end="", flush=True)
+                        except json.JSONDecodeError:
+                            continue
+            
+            print()  # 줄바꿈
             elapsed_time = time.time() - start_time
-            print(f"✓ 답변 생성 완료 (REST API): {model} ({elapsed_time:.2f}초)")
-            return {"answer": answer, "model": model}
+            print(f"\n✓ 스트리밍 답변 생성 완료 (REST API): {model} ({elapsed_time:.2f}초)")
+            return {"answer": full_answer, "model": model}
+            
         except Exception as e:
-            logger.error(f"❌ 답변 생성 중 오류: {e}")
-            print(f"❌ 답변 생성 중 오류 발생: {e}")
+            logger.error(f"❌ 스트리밍 답변 생성 중 오류: {e}")
+            print(f"❌ 스트리밍 답변 생성 중 오류 발생: {e}")
+            
+            # 스트리밍 실패 시 일반 요청으로 폴백
+            try:
+                print(f"\n⚠️ 스트리밍 실패, 일반 요청으로 시도 중...")
+                response = requests.post(
+                    f"{OLLAMA_API_BASE}/generate",
+                    json={
+                        "model": model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": params
+                    }
+                )
+                response.raise_for_status()
+                answer = response.json().get("response", "")
+                elapsed_time = time.time() - start_time
+                print(f"✓ 답변 생성 완료 (REST API): {model} ({elapsed_time:.2f}초)")
+                return {"answer": answer, "model": model}
+            except Exception as e2:
+                logger.error(f"❌ 일반 요청도 실패: {e2}")
+                return {"answer": f"답변 생성 중 오류가 발생했습니다: {str(e)}, 일반 요청도 실패: {str(e2)}", "model": model}
+            
             return {"answer": f"답변 생성 중 오류가 발생했습니다: {str(e)}", "model": model}
 
 def main():
@@ -2201,31 +2313,105 @@ class AutoEvaluator:
 점수: (1-5 사이의 정수만 입력)
 이유: (평가 이유 설명)"""
         
-    def _generate_with_ollama(self, prompt: str) -> str:
+    def _generate_with_ollama(self, prompt: str, stream=False) -> str:
         """Ollama API를 통해 평가 생성"""
         print(f"\n🤖 자동 평가 생성 중... ({self.model_name})")
         start_time = time.time()
+        
+        # Ollama 라이브러리 사용 가능 여부 확인
+        if OLLAMA_AVAILABLE:
+            try:
+                if stream:
+                    # 스트리밍 모드
+                    print("\n평가 응답: ", end="", flush=True)
+                    full_result = ""
+                    
+                    # 스트리밍 생성
+                    for chunk in ollama.generate(
+                        model=self.model_name,
+                        prompt=prompt,
+                        options={"temperature": 0.2, "top_p": 0.95, "num_predict": 1000},
+                        stream=True
+                    ):
+                        chunk_content = chunk.get("response", "")
+                        full_result += chunk_content
+                        print(chunk_content, end="", flush=True)
+                    
+                    print()  # 줄바꿈
+                    elapsed_time = time.time() - start_time
+                    print(f"✓ 평가 생성 완료 ({elapsed_time:.2f}초)")
+                    return full_result
+                else:
+                    # 일반 모드
+                    response = ollama.generate(
+                        model=self.model_name,
+                        prompt=prompt,
+                        options={"temperature": 0.2, "top_p": 0.95, "num_predict": 1000}
+                    )
+                    result = response.get("response", "")
+                    elapsed_time = time.time() - start_time
+                    print(f"✓ 평가 생성 완료 ({elapsed_time:.2f}초)")
+                    return result
+            except Exception as e:
+                print(f"⚠️ ollama 라이브러리 호출 실패: {e}, REST API로 시도합니다.")
+        
+        # REST API 사용
         try:
-            response = requests.post(
-                f"{OLLAMA_API_BASE}/generate",
-                json={
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.2, "top_p": 0.95, "num_predict": 1000}
-                }
-            )
-            response.raise_for_status()
-            result = response.json().get("response", "")
-            elapsed_time = time.time() - start_time
-            print(f"✓ 평가 생성 완료 ({elapsed_time:.2f}초)")
-            return result
+            if stream:
+                # 스트리밍 모드
+                print("\n평가 응답: ", end="", flush=True)
+                full_result = ""
+                
+                response = requests.post(
+                    f"{OLLAMA_API_BASE}/generate",
+                    json={
+                        "model": self.model_name,
+                        "prompt": prompt,
+                        "stream": True,
+                        "options": {"temperature": 0.2, "top_p": 0.95, "num_predict": 1000}
+                    },
+                    stream=True
+                )
+                response.raise_for_status()
+                
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            line_text = line.decode('utf-8')
+                            json_data = json.loads(line_text)
+                            chunk_content = json_data.get("response", "")
+                            if chunk_content:
+                                full_result += chunk_content
+                                print(chunk_content, end="", flush=True)
+                        except json.JSONDecodeError:
+                            continue
+                
+                print()  # 줄바꿈
+                elapsed_time = time.time() - start_time
+                print(f"✓ 스트리밍 평가 생성 완료 ({elapsed_time:.2f}초)")
+                return full_result
+            else:
+                # 일반 모드
+                response = requests.post(
+                    f"{OLLAMA_API_BASE}/generate",
+                    json={
+                        "model": self.model_name,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"temperature": 0.2, "top_p": 0.95, "num_predict": 1000}
+                    }
+                )
+                response.raise_for_status()
+                result = response.json().get("response", "")
+                elapsed_time = time.time() - start_time
+                print(f"✓ 평가 생성 완료 ({elapsed_time:.2f}초)")
+                return result
         except Exception as e:
             logger.error(f"❌ 자동 평가 생성 중 오류: {e}")
             print(f"❌ 자동 평가 생성 중 오류: {e}")
             return "평가 실패"
     
-    def evaluate_answer(self, question: str, context: str, answer: str) -> Dict[str, Any]:
+    def evaluate_answer(self, question: str, context: str, answer: str, stream: bool = True) -> Dict[str, Any]:
         """답변의 품질을 자동으로 평가"""
         # 컨텍스트 길이 제한 (평가 모델의 컨텍스트 윈도우 고려)
         max_context_length = 1500
@@ -2249,7 +2435,7 @@ class AutoEvaluator:
             answer=answer
         )
         
-        evaluation_result = self._generate_with_ollama(prompt)
+        evaluation_result = self._generate_with_ollama(prompt, stream=stream)
         
         # 점수 추출
         score_pattern = r"점수:\s*(\d+)"
@@ -2300,31 +2486,105 @@ class AutoQuestionGenerator:
 다음 형식으로 JSON 배열만 출력하세요:
 ["질문1", "질문2", "질문3", "질문4", "질문5"]"""
 
-    def _generate_with_ollama(self, prompt: str) -> str:
+    def _generate_with_ollama(self, prompt: str, stream: bool = True) -> str:
         """Ollama API를 통해 질문 생성"""
         print(f"\n🤖 자동 질문 생성 중... ({self.model_name})")
         start_time = time.time()
+        
+        # Ollama 라이브러리 사용 가능 여부 확인
+        if OLLAMA_AVAILABLE:
+            try:
+                if stream:
+                    # 스트리밍 모드
+                    print("\n질문 생성 응답: ", end="", flush=True)
+                    full_result = ""
+                    
+                    # 스트리밍 생성
+                    for chunk in ollama.generate(
+                        model=self.model_name,
+                        prompt=prompt,
+                        options={"temperature": 0.7, "top_p": 0.95, "num_predict": 1000},
+                        stream=True
+                    ):
+                        chunk_content = chunk.get("response", "")
+                        full_result += chunk_content
+                        print(chunk_content, end="", flush=True)
+                    
+                    print()  # 줄바꿈
+                    elapsed_time = time.time() - start_time
+                    print(f"✓ 질문 생성 완료 ({elapsed_time:.2f}초)")
+                    return full_result
+                else:
+                    # 일반 모드
+                    response = ollama.generate(
+                        model=self.model_name,
+                        prompt=prompt,
+                        options={"temperature": 0.7, "top_p": 0.95, "num_predict": 1000}
+                    )
+                    result = response.get("response", "")
+                    elapsed_time = time.time() - start_time
+                    print(f"✓ 질문 생성 완료 ({elapsed_time:.2f}초)")
+                    return result
+            except Exception as e:
+                print(f"⚠️ ollama 라이브러리 호출 실패: {e}, REST API로 시도합니다.")
+        
+        # REST API 사용
         try:
-            response = requests.post(
-                f"{OLLAMA_API_BASE}/generate",
-                json={
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.7, "top_p": 0.95, "num_predict": 1000}
-                }
-            )
-            response.raise_for_status()
-            result = response.json().get("response", "")
-            elapsed_time = time.time() - start_time
-            print(f"✓ 질문 생성 완료 ({elapsed_time:.2f}초)")
-            return result
+            if stream:
+                # 스트리밍 모드
+                print("\n질문 생성 응답: ", end="", flush=True)
+                full_result = ""
+                
+                response = requests.post(
+                    f"{OLLAMA_API_BASE}/generate",
+                    json={
+                        "model": self.model_name,
+                        "prompt": prompt,
+                        "stream": True,
+                        "options": {"temperature": 0.7, "top_p": 0.95, "num_predict": 1000}
+                    },
+                    stream=True
+                )
+                response.raise_for_status()
+                
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            line_text = line.decode('utf-8')
+                            json_data = json.loads(line_text)
+                            chunk_content = json_data.get("response", "")
+                            if chunk_content:
+                                full_result += chunk_content
+                                print(chunk_content, end="", flush=True)
+                        except json.JSONDecodeError:
+                            continue
+                
+                print()  # 줄바꿈
+                elapsed_time = time.time() - start_time
+                print(f"✓ 스트리밍 질문 생성 완료 ({elapsed_time:.2f}초)")
+                return full_result
+            else:
+                # 일반 모드
+                response = requests.post(
+                    f"{OLLAMA_API_BASE}/generate",
+                    json={
+                        "model": self.model_name,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"temperature": 0.7, "top_p": 0.95, "num_predict": 1000}
+                    }
+                )
+                response.raise_for_status()
+                result = response.json().get("response", "")
+                elapsed_time = time.time() - start_time
+                print(f"✓ 질문 생성 완료 ({elapsed_time:.2f}초)")
+                return result
         except Exception as e:
             logger.error(f"❌ 자동 질문 생성 중 오류: {e}")
             print(f"❌ 자동 질문 생성 중 오류: {e}")
             return "[]"
 
-    def generate_questions(self, context: str) -> List[str]:
+    def generate_questions(self, context: str, stream: bool = True) -> List[str]:
         """문서 컨텍스트를 기반으로 질문 생성"""
         # 컨텍스트 길이 제한
         max_context_length = 2000
@@ -2343,7 +2603,7 @@ class AutoQuestionGenerator:
             context = "\n\n".join(optimized_context)
         
         prompt = self.question_prompt_template.format(context=context)
-        response = self._generate_with_ollama(prompt)
+        response = self._generate_with_ollama(prompt, stream=stream)
         
         try:
             # JSON 추출
@@ -2391,7 +2651,7 @@ class AutoTestManager:
             "summary": {}
         }
     
-    def run_auto_test(self, num_questions: int = 5, top_k: int = 10):
+    def run_auto_test(self, num_questions: int = 5, top_k: int = 10, stream: bool = True):
         """자동 질문 생성 및 평가 테스트 실행"""
         print(f"\n{'='*80}")
         print(f"🚀 자동 테스트 시작 (질문 수: {num_questions})")
@@ -2414,56 +2674,74 @@ class AutoTestManager:
                 sample_docs = random.sample(docs, min(5, len(docs)))
                 context = "\n\n".join([f"[페이지 {doc.metadata.get('page', '불명')}] {doc.page_content}" for doc in sample_docs])
                 
-                # 컨텍스트에서 질문 생성
-                print(f"\n🤔 테스트 질문 생성 중...")
-                questions = self.question_generator.generate_questions(context)
+                # 자동 질문 생성
+                print("\n📝 컨텍스트에서 질문 생성 중...")
+                questions = self.question_generator.generate_questions(context, stream=stream)
                 
-                # 생성된 질문으로 테스트 실행
-                for q_idx, question in enumerate(questions):
-                    print(f"\n{'─'*80}")
-                    print(f"💬 질문 {i+1}-{q_idx+1}: {question}")
-                    print(f"{'─'*80}")
+                if not questions:
+                    print("❌ 질문 생성 실패, 다음 컨텍스트로 넘어갑니다.")
+                    continue
+                
+                print(f"\n✅ {len(questions)}개 질문 생성 완료:")
+                for j, q in enumerate(questions):
+                    print(f"  {j+1}. {q}")
+                
+                # 각 질문에 대해 RAG 시스템으로 응답 생성 및 평가
+                for j, question in enumerate(questions[:min(5, len(questions))]):
+                    print(f"\n{'='*50}")
+                    print(f"📊 테스트 #{i+1}-{j+1}: '{question}'")
                     
-                    # 문서 검색
-                    retrieved_docs = self.rag.search(question, top_k=top_k)
-                    if not retrieved_docs:
-                        print("❌ 관련 문서를 찾을 수 없어 이 질문은 건너뜁니다.")
-                        continue
-                    
-                    test_context = self.rag.format_context_for_model(retrieved_docs)
-                    
-                    # 모델별 답변 생성 및 평가
-                    question_results = {
+                    test_results = {
                         "question": question,
+                        "context_summary": context[:200] + "..." if len(context) > 200 else context,
                         "models": {}
                     }
                     
+                    # 모든 모델에 대해 답변 생성 및 평가
                     for model in self.available_models:
-                        print(f"\n📌 {model} 모델로 답변 생성 중...")
-                        result = self.rag.answer(question, model, test_context)
-                        answer = result["answer"]
+                        print(f"\n🔄 모델 '{model}' 테스트 중...")
                         
-                        # 답변 자동 평가
-                        print(f"📊 {model} 모델 답변 자동 평가 중...")
-                        evaluation = self.auto_evaluator.evaluate_answer(question, test_context, answer)
-                        
-                        # 평가 결과 저장
-                        score = evaluation.get("score")
-                        if score is not None:
-                            model_scores[model].append(score)
-                        
-                        question_results["models"][model] = {
-                            "answer": answer,
-                            "evaluation": evaluation
-                        }
-                        
-                        # 결과 출력
-                        score_text = f"점수: {score}/5" if score is not None else "점수: 평가 불가"
-                        print(f"🤖 자동 평가: {score_text}")
-                        print(f"이유: {evaluation.get('reason', '평가 이유 추출 실패')[:200]}...")
+                        # 검색 및 답변 생성
+                        try:
+                            sources, answer = self.rag.query(
+                                question, 
+                                model_name=model, 
+                                top_k=top_k
+                            )
+                            
+                            # 자동 평가 수행
+                            evaluation = self.auto_evaluator.evaluate_answer(
+                                question, 
+                                context, 
+                                answer,
+                                stream=stream
+                            )
+                            
+                            # 평가 결과 저장
+                            test_results["models"][model] = {
+                                "answer": answer,
+                                "score": evaluation.get("score"),
+                                "reason": evaluation.get("reason"),
+                                "raw_evaluation": evaluation.get("raw_evaluation")
+                            }
+                            
+                            # 모델 점수 집계
+                            if evaluation.get("score") is not None:
+                                model_scores[model].append(evaluation.get("score"))
+                                
+                            print(f"📊 평가 점수: {evaluation.get('score', '평가 불가')}/5")
+                            
+                        except Exception as e:
+                            logger.error(f"모델 {model} 테스트 중 오류: {e}")
+                            print(f"❌ 모델 {model} 테스트 중 오류: {e}")
+                            test_results["models"][model] = {
+                                "error": str(e)
+                            }
                     
-                    # 이 질문의 결과를 전체 결과에 추가
-                    all_test_results.append(question_results)
+                    # 테스트 결과 저장
+                    all_test_results.append(test_results)
+                    
+                    print(f"{'='*50}")
             
             # 요약 통계 계산
             summary = {}
