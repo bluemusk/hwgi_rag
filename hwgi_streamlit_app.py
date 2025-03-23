@@ -63,6 +63,26 @@ if 'auto_test_log' not in st.session_state:
     st.session_state.auto_test_log = ""
 if 'run_ids' not in st.session_state:
     st.session_state.run_ids = {}
+# RAG 시스템 세션 상태에 추가
+if 'rag_system' not in st.session_state:
+    st.session_state.rag_system = None
+if 'vector_store_initialized' not in st.session_state:
+    st.session_state.vector_store_initialized = False
+if 'pdf_processed' not in st.session_state:
+    st.session_state.pdf_processed = False
+if 'current_pdf' not in st.session_state:
+    st.session_state.current_pdf = None
+# 실시간 스트리밍 관련 상태 추가
+if 'stream_output' not in st.session_state:
+    st.session_state.stream_output = ""
+if 'stream_status' not in st.session_state:
+    st.session_state.stream_status = "ready"
+if 'stream_complete' not in st.session_state:
+    st.session_state.stream_complete = False
+if 'current_model' not in st.session_state:
+    st.session_state.current_model = ""
+if 'current_stage' not in st.session_state:
+    st.session_state.current_stage = ""
 
 # 더미 traceable 데코레이터 함수 정의 (LangSmith 비활성화 시 사용)
 def dummy_traceable(*args, **kwargs):
@@ -172,9 +192,24 @@ force_update = st.sidebar.checkbox("벡터 인덱스 강제 업데이트", value
 # use_hnsw = st.sidebar.checkbox("HNSW 인덱스 사용 (정확도 향상)", value=True)
 use_hnsw = True
 
-# 자동 평가 옵션 (체크박스는 제거하고 기본값 설정)
-# auto_eval = st.sidebar.checkbox("자동 평가 활성화 (gemma3:12b 필요)", value=True)
-auto_eval = True
+# 모델 선택 옵션 추가
+st.sidebar.markdown("---")
+st.sidebar.subheader("🤖 모델 설정")
+
+# 사용 가능한 모델 목록 (hwgi_rag_auto.py와 동일하게 유지)
+AVAILABLE_MODELS = ["gemma3:1b", "gemma3:4b", "gemma3:12b"]
+
+# 기본 모델 선택
+selected_model = st.sidebar.selectbox(
+    "사용할 모델 선택",
+    options=AVAILABLE_MODELS,
+    index=0,  # 기본값은 첫 번째 모델
+    help="질문에 답변할 AI 모델을 선택하세요. 큰 모델일수록 더 정확한 답변을 제공할 수 있지만 처리 시간이 더 오래 걸릴 수 있습니다."
+)
+
+# 자동 평가 옵션 (체크박스로 변경)
+auto_eval = st.sidebar.checkbox("자동 평가 활성화 (gemma3:12b 필요)", value=False)
+# auto_eval = True
 
 # 메인 영역
 tab1, tab2, tab3 = st.tabs(["💬 질문 응답", "🔄 자동 테스트", "🔍 디버그"])
@@ -225,7 +260,7 @@ def extract_multi_queries_and_docs(output):
 
 # LangSmith로 추적하는 백그라운드 질문 처리 함수
 @traceable(name="process_question", run_type="chain")
-def process_question_with_file(question, pdf_path, chunk_size, chunk_overlap, top_k, force_update, use_hnsw, auto_eval):
+def process_question_with_file(question, pdf_path, chunk_size, chunk_overlap, top_k, force_update, use_hnsw, auto_eval, model=None):
     # 임시 파일 생성
     with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt') as temp_file:
         temp_file.write(question)
@@ -235,19 +270,56 @@ def process_question_with_file(question, pdf_path, chunk_size, chunk_overlap, to
         # 프로세스 실행 중 플래그 설정
         st.session_state.process_running = True
         st.session_state.raw_output = "쿼리 처리 시작 중...\n"
+        st.session_state.stream_output = "쿼리 처리 시작 중...\n"
+        st.session_state.stream_status = "running"
+        st.session_state.stream_complete = False
+        st.session_state.current_stage = "초기화"
         
-        # 명령어 구성
-        cmd = [
-            "python3", "hwgi_rag_auto.py",
-            "--pdf", pdf_path,
-            "--chunk-size", str(chunk_size),
-            "--chunk-overlap", str(chunk_overlap),
-            "--top-k", str(top_k)
-        ]
+        # RAG 시스템이 초기화되어 있고 동일한 PDF 파일을 사용 중이라면 기존 RAG 시스템 재사용
+        if (st.session_state.rag_system is not None and 
+            st.session_state.vector_store_initialized and 
+            st.session_state.current_pdf == pdf_path and
+            not force_update):
+            
+            st.session_state.raw_output += "기존 RAG 시스템을 재사용합니다...\n"
+            st.session_state.stream_output += "기존 RAG 시스템을 재사용합니다...\n"
+            
+            # 기존에 로드된 RAG 시스템을 사용하여 명령어 구성
+            cmd = [
+                "python3", "hwgi_rag_auto.py",
+                "--pdf", pdf_path,
+                "--chunk-size", str(chunk_size),
+                "--chunk-overlap", str(chunk_overlap),
+                "--top-k", str(top_k),
+                "--reuse-index"  # 이미 인덱스가 초기화되어 있음을 알리는 플래그 추가
+            ]
+        else:
+            # PDF가 변경되었거나 처음 실행하는 경우 새로 초기화
+            st.session_state.raw_output += "새 RAG 시스템을 초기화합니다...\n"
+            st.session_state.stream_output += "새 RAG 시스템을 초기화합니다...\n"
+            
+            # 명령어 구성
+            cmd = [
+                "python3", "hwgi_rag_auto.py",
+                "--pdf", pdf_path,
+                "--chunk-size", str(chunk_size),
+                "--chunk-overlap", str(chunk_overlap),
+                "--top-k", str(top_k)
+            ]
+            
+            # 초기화 상태 업데이트
+            st.session_state.current_pdf = pdf_path
+            st.session_state.vector_store_initialized = False
+        
+        # 모델 추가
+        if model:
+            cmd.extend(["--model", model])
+            st.session_state.current_model = model
         
         # 추가 옵션
         if force_update:
             cmd.append("--force-update")
+            st.session_state.vector_store_initialized = False  # 강제 업데이트 시 초기화 상태 리셋
         if not use_hnsw:
             cmd.append("--flat-index")
         if auto_eval:
@@ -257,35 +329,97 @@ def process_question_with_file(question, pdf_path, chunk_size, chunk_overlap, to
         cmd_str = ' '.join(cmd)
         print(f"실행 명령어: {cmd_str}")
         st.session_state.raw_output += f"실행 명령어: {cmd_str}\n\n"
-        st.session_state.raw_output += "쿼리 실행 중...\n"
+        st.session_state.stream_output += f"실행 명령어: {cmd_str}\n\n"
+        st.session_state.stream_output += "쿼리 실행 중...\n"
         
         # 파일에서 질문 읽기 위한 입력 리디렉션 방식으로 변경
-        # 이렇게 하면 명령행 인수로 질문을 전달하지 않아 공백 문제를 피할 수 있음
         with open(temp_file_path, 'r') as input_file:
-            result = subprocess.run(
+            # Popen을 사용하여 실시간 출력 캡처
+            process = subprocess.Popen(
                 cmd,
                 stdin=input_file,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=300
+                bufsize=1
             )
+
+            # 실시간 출력 처리
+            stdout_data = []
+            stderr_data = []
             
-            # 디버깅을 위한 출력 (stderr가 있는 경우만)
-            if result.stderr:
-                print(f"하위 프로세스 오류 출력: {result.stderr}")
-                st.session_state.raw_output += f"\n오류 출력:\n{result.stderr}\n"
+            # stdout 처리를 위한 내부 함수
+            def process_stdout_line(line):
+                stdout_data.append(line)
+                st.session_state.raw_output += line
+                st.session_state.stream_output += line
+                
+                # 현재 단계 업데이트
+                if "1단계: PDF 처리" in line:
+                    st.session_state.current_stage = "PDF 처리"
+                elif "2단계: 쿼리 확장" in line:
+                    st.session_state.current_stage = "쿼리 확장"
+                elif "3단계: 문서 검색" in line:
+                    st.session_state.current_stage = "문서 검색"
+                elif "4단계: 답변 생성" in line:
+                    st.session_state.current_stage = "답변 생성"
+                    # 모델 이름 추출
+                    model_match = re.search(r"답변 생성 \(([^)]+)\)", line)
+                    if model_match:
+                        st.session_state.current_model = model_match.group(1)
             
-            # 표준 출력 추가
-            if result.stdout:
-                st.session_state.raw_output += f"\n명령 출력:\n{result.stdout}\n"
+            # 실시간으로 출력 처리
+            while process.poll() is None:
+                # stdout 처리
+                stdout_line = process.stdout.readline()
+                if stdout_line:
+                    process_stdout_line(stdout_line)
+                
+                # stderr 처리
+                stderr_line = process.stderr.readline()
+                if stderr_line:
+                    stderr_data.append(stderr_line)
+                    st.session_state.raw_output += f"오류: {stderr_line}"
+                    st.session_state.stream_output += f"오류: {stderr_line}"
+            
+            # 남은 출력 처리
+            for stdout_line in process.stdout.readlines():
+                process_stdout_line(stdout_line)
+            
+            for stderr_line in process.stderr.readlines():
+                stderr_data.append(stderr_line)
+                st.session_state.raw_output += f"오류: {stderr_line}"
+                st.session_state.stream_output += f"오류: {stderr_line}"
+            
+            # 결과 반환값 생성
+            return_code = process.returncode
+            stdout_content = ''.join(stdout_data)
+            stderr_content = ''.join(stderr_data)
             
             # 실행 완료 메시지 추가
-            if result.returncode == 0:
+            if return_code == 0:
                 st.session_state.raw_output += "\n✅ 프로세스 실행 완료\n"
+                st.session_state.stream_output += "\n✅ 프로세스 실행 완료\n"
+                st.session_state.stream_status = "complete"
+                st.session_state.stream_complete = True
+                # 벡터 저장소 초기화 상태 설정
+                if "벡터 저장소가 초기화되었습니다" in stdout_content or "벡터 저장소를 로드했습니다" in stdout_content:
+                    st.session_state.vector_store_initialized = True
             else:
-                st.session_state.raw_output += f"\n❌ 프로세스 실행 실패 (종료 코드: {result.returncode})\n"
-                
-        return result
+                st.session_state.raw_output += f"\n❌ 프로세스 실행 실패 (종료 코드: {return_code})\n"
+                st.session_state.stream_output += f"\n❌ 프로세스 실행 실패 (종료 코드: {return_code})\n"
+                st.session_state.stream_status = "error"
+                st.session_state.stream_complete = True
+                st.session_state.vector_store_initialized = False
+            
+            # subprocess.CompletedProcess와 유사한 객체 반환
+            class ProcessResult:
+                def __init__(self, returncode, stdout, stderr):
+                    self.returncode = returncode
+                    self.stdout = stdout
+                    self.stderr = stderr
+            
+            return ProcessResult(return_code, stdout_content, stderr_content)
     finally:
         # 임시 파일 삭제
         if os.path.exists(temp_file_path):
@@ -293,9 +427,41 @@ def process_question_with_file(question, pdf_path, chunk_size, chunk_overlap, to
         # 프로세스 종료 플래그 설정
         st.session_state.process_running = False
 
+# 실시간 출력 업데이트 함수
+def update_streaming_output():
+    """실시간 출력을 업데이트하는 함수"""
+    if 'progress_container' in st.session_state and 'output_container' in st.session_state:
+        # 현재 진행 상황 표시
+        if st.session_state.current_stage:
+            progress_text = f"현재 단계: {st.session_state.current_stage}"
+            if st.session_state.current_model:
+                progress_text += f" (모델: {st.session_state.current_model})"
+            st.session_state.progress_container.info(progress_text)
+        
+        # 현재 출력 표시 (최대 1000자 제한)
+        max_output_len = 20000
+        current_output = st.session_state.stream_output
+        if len(current_output) > max_output_len:
+            display_output = "...(이전 출력 생략)...\n" + current_output[-max_output_len:]
+        else:
+            display_output = current_output
+        
+        # 스크롤 가능한 출력 영역으로 표시
+        st.session_state.output_container.code(display_output, height=400)
+
 # 질문 응답 탭
 with tab1:
     st.header("질문 응답")
+    
+    # 시스템 상태 정보 표시
+    system_status = st.empty()
+    if st.session_state.vector_store_initialized:
+        system_status.success("✅ RAG 시스템 준비 완료 - 질문을 입력하세요")
+    else:
+        system_status.info("ℹ️ 첫 질문을 입력하면 RAG 시스템이 초기화됩니다 (최초 실행 시 시간이 소요될 수 있습니다)")
+    
+    # 실시간 출력 표시 컨테이너 (초기에는 숨김)
+    stream_container = st.empty()
     
     # 저장된 쿼리 결과 확인 옵션 추가
     query_results_files = get_query_results_files()
@@ -347,9 +513,40 @@ with tab1:
         # 질문 입력
         question = st.text_area("질문을 입력하세요:", height=100, value=st.session_state.last_question)
         
-        if st.button("질문 제출", type="primary", disabled=(not selected_pdf)):
+        # 체크박스 제거
+        submit_button = st.button("질문 제출", type="primary", disabled=(not selected_pdf))
+        
+        if submit_button:
             if question:
                 st.session_state.last_question = question
+                
+                # 실시간 출력 컨테이너 준비
+                stream_status = st.empty()
+                stream_status.info("처리 중...")
+                
+                # 실시간 출력 표시를 위한 컨테이너
+                progress_container = st.empty()
+                output_container = st.empty()
+                
+                # 세션 상태에 컨테이너 저장
+                st.session_state.progress_container = progress_container
+                st.session_state.output_container = output_container
+                
+                # 세션 상태 초기화
+                st.session_state.stream_output = ""
+                st.session_state.stream_status = "running"
+                st.session_state.stream_complete = False
+                st.session_state.current_model = ""
+                st.session_state.current_stage = "초기화"
+                
+                # 실시간 업데이트 스레드 시작
+                def update_thread():
+                    while not st.session_state.stream_complete:
+                        update_streaming_output()
+                        time.sleep(0.5)
+                
+                # 스레드 시작
+                threading.Thread(target=update_thread, daemon=True).start()
                 
                 with st.spinner("질문에 답변 생성 중..."):
                     try:
@@ -381,7 +578,8 @@ with tab1:
                             top_k,
                             force_update,
                             use_hnsw,
-                            auto_eval
+                            auto_eval,
+                            selected_model  # 선택된 모델 전달
                         )
                         
                         # 결과 처리
@@ -389,6 +587,15 @@ with tab1:
                             output = result.stdout
                             # 디버깅을 위해 원본 출력 저장
                             st.session_state.raw_output = output
+                            
+                            # 실시간 출력이 활성화된 경우 최종 상태 업데이트
+                            if st.session_state.stream_status == "complete":
+                                stream_status.success("✅ 처리 완료!")
+                                # '처리 완료' 메시지가 중복 표시되지 않도록 주석 처리
+                                # progress_container.success("✅ 처리 완료!")
+                            elif st.session_state.stream_status == "error":
+                                stream_status.error("❌ 오류 발생")
+                                progress_container.error("❌ 오류 발생")
                             
                             # 원본 쿼리, 멀티쿼리와 문서 요약 정보 추출
                             original_query, multi_queries, doc_summaries = extract_multi_queries_and_docs(output)
@@ -441,11 +648,6 @@ with tab1:
                                     end_time=datetime.utcnow(),
                                     error=result.stderr
                                 )
-                        
-                        # 로그 표시
-                        # if result.stderr:
-                        #     st.error("오류 발생:")
-                        #     st.code(result.stderr)
                     
                     except subprocess.TimeoutExpired as e:
                         st.warning("실행 시간이 너무 깁니다. 프로세스가 계속 실행 중일 수 있습니다.")
@@ -552,6 +754,10 @@ with tab2:
             "--top-k", str(top_k),
             "--auto-test"
         ]
+        
+        # 모델 추가
+        if selected_model:
+            cmd.extend(["--model", selected_model])
         
         # 자동 평가 옵션 추가 
         if auto_eval:

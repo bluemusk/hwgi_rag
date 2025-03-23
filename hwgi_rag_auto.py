@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from dotenv import load_dotenv
 import asyncio
+import random
 import time
 import io
 import base64
@@ -78,7 +79,7 @@ OLLAMA_API_BASE = "http://localhost:11434/api"
 
 # 사용 가능한 모델 설정
 # AVAILABLE_MODELS = ["gemma3:4b", "llama3.1:8b", "gemma3:12b"]
-AVAILABLE_MODELS = ["gemma3:12b"]
+AVAILABLE_MODELS = ["gemma3:1b","gemma3:4b","gemma3:12b"]
 # 모델 설정
 EMBEDDING_MODELS = {
     "bge-m3": {
@@ -823,6 +824,17 @@ class RAGSystem:
 (위 정보들을 바탕으로 3-4문장으로 답변)"""
         print("✅ RAG 시스템 초기화 완료")
         
+        # 시스템 초기화 완료 후 벡터 저장소가 사용 가능한지 확인
+        # 이미 벡터 저장소가 있는 경우 바로 로드 - 스트림릿에서 재사용 가능하도록
+        if os.path.exists(self.index_dir):
+            try:
+                print(f"기존 벡터 인덱스 경로 확인됨: {self.index_dir}")
+                index_files = glob.glob(os.path.join(self.index_dir, "*.faiss"))
+                if index_files:
+                    print(f"벡터 인덱스 파일 감지됨, 로드 준비 완료")
+            except Exception as e:
+                print(f"⚠️ 벡터 인덱스 확인 중 오류: {e}")
+    
     def _load_cache(self) -> Dict[str, str]:
         """캐시 파일을 안전하게 로드합니다."""
         try:
@@ -887,219 +899,92 @@ class RAGSystem:
             return f"[{model} 모델 응답 생성 실패] 오류: {str(e)}"
     
     def load_or_create_vector_store(self, documents: List[Document], force_update: bool = False) -> bool:
-        if not force_update and os.path.exists(self.index_dir) and os.path.exists(self.metadata_file):
-            try:
-                self.vector_store = FAISS.load_local(self.index_dir, self.embeddings, allow_dangerous_deserialization=True)
-                with open(self.metadata_file, 'r', encoding='utf-8') as f:
-                    existing_metadata = json.load(f)
-                existing_hashes = set(existing_metadata.get('hashes', []))
-                new_docs = [doc for doc in documents if doc.metadata.get('hash') not in existing_hashes]
-                if new_docs:
-                    self.vector_store.add_documents(new_docs)
-                    self.vector_store.save_local(self.index_dir)
-                    self._save_document_metadata(documents, self.metadata_file)
-            except Exception as e:
-                logger.error(f"❌ 인덱스 로드 중 오류: {e}")
-                return self._create_new_vector_store(documents)
-        else:
-            return self._create_new_vector_store(documents)
-        return True
-    
-    def _create_new_vector_store(self, documents, hnsw_space='l2'):
-        """문서 임베딩 및 벡터 저장소 생성"""
-        print(f"\n{'─'*60}")
-        print(f"📊 벡터 저장소 생성 중... ")
-        print(f"{'─'*60}")
-        
-        # 문서가 없는 경우 처리
-        if not documents or len(documents) == 0:
-            print("⚠️ 문서가 없습니다. 빈 벡터 저장소를 생성합니다.")
-            try:
-                # 임베딩 차원 결정
-                embedding_dim = 768  # 기본 차원
-                try:
-                    # 테스트 문장으로 임베딩 차원 확인
-                    embedding_dim = len(self.embeddings.embed_query("테스트"))
-                    print(f"✓ 임베딩 차원 확인됨: {embedding_dim}")
-                except Exception as e:
-                    print(f"⚠️ 임베딩 차원 확인 실패: {e}, 기본값 {embedding_dim} 사용")
-                
-                # 빈 인덱스 구성 요소 생성
-                empty_index, docstore, index_to_docstore_id = create_empty_faiss_index(embedding_dim)
-                
-                if empty_index is None:
-                    print("❌ 빈 인덱스 생성 실패")
-                    return None
-                
-                # 벡터 저장소 생성
-                from langchain.vectorstores import FAISS
-                vector_store = FAISS(
-                    embedding_function=self.embeddings,
-                    index=empty_index,
-                    docstore=docstore,
-                    index_to_docstore_id=index_to_docstore_id
-                )
-                
-                print("✓ 빈 벡터 저장소 생성 완료")
-                # 저장 정보 설정
-                self.document_count = 0
-                
-                # 저장소 경로가 존재하는지 확인하고 생성
-                if self.index_dir:
-                    if not os.path.exists(self.index_dir):
-                        os.makedirs(self.index_dir, exist_ok=True)
-                    try:
-                        vector_store.save_local(self.index_dir)
-                        self._save_document_metadata([], self.metadata_file)
-                        print(f"✓ 빈 벡터 저장소 저장 완료: {self.index_dir}")
-                    except Exception as save_err:
-                        print(f"⚠️ 빈 벡터 저장소 저장 실패: {save_err}")
-                
-                return vector_store
-                
-            except Exception as e:
-                print(f"❌ 빈 벡터 저장소 생성 실패: {e}")
-                return None
-        
-        print(f"🔢 문서 수: {len(documents)}")
-        
-        # 최대 문서 수 제한 (8000개)
-        if len(documents) > 8000:
-            print(f"⚠️ 문서가 너무 많습니다 ({len(documents)}개). 처음 8000개만 사용합니다.")
-            documents = documents[:8000]
-        
-        # 문서 임베딩 전 안전 검사
+        """벡터 저장소 로드 또는 생성"""
         try:
-            if not self.embeddings:
-                print("❌ 임베딩 모델이 초기화되지 않았습니다.")
-                return None
-                
-            print("🔄 문서 임베딩 및 벡터 저장소 생성 중...")
-            start_time = time.time()
+            if self.vector_store is not None and not force_update:
+                print(f"✓ 벡터 저장소가 이미 초기화되어 있습니다.")
+                return True
             
-            # 먼저 임베딩 차원 확인
-            embedding_dim = 768  # 기본 차원
-            try:
-                embedding_dim = len(self.embeddings.embed_query("테스트"))
-                print(f"✓ 임베딩 차원: {embedding_dim}")
-            except Exception as e:
-                print(f"⚠️ 임베딩 차원 확인 실패: {e}, 기본값 {embedding_dim} 사용")
+            # 인덱스 디렉토리 확인 및 생성
+            os.makedirs(self.index_dir, exist_ok=True)
             
-            # FAISS 벡터 저장소 생성 시도
-            try:
-                vector_store = None
-                # HNSW 인덱스로 생성 시도
+            # 기존 인덱스 확인
+            index_files = glob.glob(os.path.join(self.index_dir, "*.faiss"))
+            
+            # 문서가 없고 업데이트 요청도 없는 경우, 기존 인덱스 로드 시도
+            if not documents and not force_update and index_files:
+                print(f"🔄 벡터 저장소 '{self.index_dir}' 로드 중...")
                 try:
-                    if hnsw_space == 'cosine':
-                        print("🔄 HNSW 코사인 유사도 인덱스 생성 중...")
-                        vector_store = FAISS.from_documents(
-                            documents, 
-                            self.embeddings,
-                            normalize_L2=True,  # 코사인 유사도를 위한 정규화
-                            space='inner_product',  # 내적 사용
-                            m=64,  # HNSW 그래프의 이웃 수
-                            ef_construction=128  # 구축 시 고려할 이웃 수
-                        )
-                    else:  # 'l2' 또는 기타
-                        print("🔄 HNSW L2 거리 인덱스 생성 중...")
-                        vector_store = FAISS.from_documents(
-                            documents, 
-                            self.embeddings,
-                            normalize_L2=False,  # L2 거리는 정규화 필요 없음
-                            space='l2',  # L2 거리 사용
-                            m=64,
-                            ef_construction=128
-                        )
-                    print("✓ HNSW 인덱스 생성 완료")
-                except Exception as hnsw_error:
-                    print(f"❌ HNSW 인덱스 생성 실패: {hnsw_error}")
-                    print("⚠️ 기본 인덱스로 재시도 중...")
-                    vector_store = None
-                
-                # 기본 방법으로 재시도
-                if vector_store is None:
-                    print("🔄 기본 인덱스 생성 중...")
-                    try:
-                        vector_store = FAISS.from_documents(documents, self.embeddings)
-                        print("✓ 기본 인덱스 생성 완료")
-                    except Exception as basic_error:
-                        print(f"❌ 기본 인덱스 생성 실패: {basic_error}")
-                        print("⚠️ 안전 모드로 재시도 중...")
-                        
-                        # 안전 모드로 벡터 저장소 생성 (직접 임베딩 생성)
-                        try:
-                            # 문서 내용 리스트 생성
-                            texts = [doc.page_content for doc in documents]
-                            
-                            # 임베딩 생성
-                            embeddings_list = self.embeddings.embed_documents(texts)
-                            
-                            # 빈 인덱스 생성
-                            import numpy as np
-                            import faiss
-                            import uuid
-                            
-                            # 벡터 임베딩으로 인덱스 생성
-                            index = faiss.IndexFlatL2(embedding_dim)
-                            if len(embeddings_list) > 0:
-                                index.add(np.array(embeddings_list, dtype=np.float32))
-                            
-                            # 문서 저장소 생성
-                            docstore = {}
-                            index_to_docstore_id = {}
-                            
-                            # 문서와 인덱스 매핑
-                            for i, doc in enumerate(documents):
-                                id = str(uuid.uuid4())
-                                docstore[id] = doc
-                                index_to_docstore_id[i] = id
-                            
-                            # FAISS 객체 생성
-                            vector_store = FAISS(
-                                embedding_function=self.embeddings,
-                                index=index,
-                                docstore=docstore,
-                                index_to_docstore_id=index_to_docstore_id
-                            )
-                            print("✓ 안전 모드로 인덱스 생성 완료")
-                        except Exception as safe_error:
-                            print(f"❌ 안전 모드로도 생성 실패: {safe_error}")
-                            return None
-                
-                elapsed_time = time.time() - start_time
-                print(f"✓ 벡터 저장소 생성 완료 ({elapsed_time:.2f}초)")
-                
-                # 메타데이터 저장
-                self.document_count = len(documents)
-                
-                # 저장소 경로가 존재하는지 확인하고 생성
-                if self.index_dir and vector_store is not None:
-                    if not os.path.exists(self.index_dir):
-                        os.makedirs(self.index_dir, exist_ok=True)
-                    try:
-                        vector_store.save_local(self.index_dir)
-                        self._save_document_metadata(documents, self.metadata_file)
-                        print(f"✓ 벡터 저장소 저장 완료: {self.index_dir}")
-                    except Exception as save_err:
-                        print(f"⚠️ 벡터 저장소 저장 실패: {save_err}")
-                
-                return vector_store
-                
-            except Exception as e:
-                print(f"❌ 벡터 저장소 생성 중 오류: {e}")
-                print(f"⚠️ 남은 문서 수로 재시도: {len(documents)//2}개")
-                
-                if len(documents) > 1:
-                    # 문서 수를 절반으로 줄여서 재시도
-                    half_docs = documents[:len(documents)//2]
-                    return self._create_new_vector_store(half_docs, hnsw_space)
-                else:
-                    print("❌ 재시도 실패: 문서가 너무 적습니다")
-                    return None
+                    self.vector_store = FAISS.load_local(
+                        self.index_dir,
+                        self.embeddings,
+                        allow_dangerous_deserialization=True
+                    )
+                    print(f"✅ 벡터 저장소를 로드했습니다: {self.index_dir}")
                     
-        except Exception as outer_e:
-            print(f"❌ 벡터 저장소 생성 중 심각한 오류: {outer_e}")
-            return None
+                    # 로드된 벡터 저장소 정보 출력
+                    try:
+                        num_documents = len(self.vector_store.docstore._dict)
+                        print(f"✓ 로드된 문서 수: {num_documents}개")
+                    except Exception as e:
+                        print(f"⚠️ 문서 수 확인 중 오류: {e}")
+                    
+                    return True
+                except Exception as e:
+                    logger.error(f"벡터 저장소 로드 실패: {e}")
+                    print(f"❌ 벡터 저장소 로드 실패: {e}")
+                    if force_update and documents:
+                        print("🔄 강제 업데이트 옵션이 활성화되어 새 인덱스를 생성합니다...")
+                    else:
+                        return False
+            
+            # 문서가 있거나 강제 업데이트 요청된 경우, 새 인덱스 생성
+            if documents:
+                print(f"🔄 새 벡터 저장소 생성 중... (문서 수: {len(documents)})")
+                
+                # HNSW 인덱스 사용 시 FAISS 설정
+                if self.use_hnsw:
+                    print(f"✓ HNSW 인덱스 파라미터: ef_search={self.ef_search}, ef_construction={self.ef_construction}, M={self.m}")
+                    
+                    # FAISS 인덱스 생성
+                    self.vector_store = FAISS.from_documents(
+                        documents,
+                        self.embeddings,
+                        normalize_L2=True
+                    )
+                    
+                    # HNSW 인덱스 파라미터 설정
+                    try:
+                        index = self.vector_store.index
+                        if hasattr(index, 'hnsw'):
+                            index.hnsw.efSearch = self.ef_search
+                            index.hnsw.efConstruction = self.ef_construction
+                            print(f"✓ HNSW 인덱스 파라미터 설정 완료")
+                    except Exception as e:
+                        print(f"⚠️ HNSW 파라미터 설정 중 오류: {e}")
+                else:
+                    # 기본 Flat 인덱스 생성
+                    print(f"✓ Flat 인덱스 생성 중... (문서 수: {len(documents)})")
+                    self.vector_store = FAISS.from_documents(
+                        documents,
+                        self.embeddings,
+                        normalize_L2=True
+                    )
+                
+                # 인덱스 저장
+                self.vector_store.save_local(self.index_dir)
+                print(f"✅ 새 벡터 저장소가 '{self.index_dir}'에 저장되었습니다")
+                
+                return True
+            else:
+                # 문서도 없고 기존 인덱스도 로드할 수 없는 경우
+                print(f"❌ 문서가 없고 기존 인덱스도 로드할 수 없습니다.")
+                return False
+                
+        except Exception as e:
+            logger.error(f"벡터 저장소 생성/로드 중 오류: {e}")
+            print(f"❌ 벡터 저장소 생성/로드 중 오류 발생: {e}")
+            return False
     
     def search(self, query: str, top_k: int = 12) -> List[Document]:
         """쿼리에 관련된 문서를 검색합니다."""
@@ -1274,66 +1159,8 @@ def main():
     
     print("\n" + "="*60)
     print("📊 한화손해보험 사업보고서 RAG 시스템")
-    print("(Gemma3:12b 모델)")
+    print(f"(현재 선택된 모델: {AVAILABLE_MODELS[0] if AVAILABLE_MODELS else '모델 없음'})")
     print("="*60)
-    print("🔄 Ollama 서버 연결 확인 중...")
-    
-    supported_models = []
-    # Ollama 사용 가능 여부 확인
-    try:
-        response = requests.get(f"{OLLAMA_API_BASE}/tags")
-        response.raise_for_status()
-        models = response.json().get("models", [])
-        installed_models = [model.get("name") for model in models]
-        print(f"✓ Ollama 서버 연결 성공")
-        
-        # 지원되는 모델 선별
-        supported_models = [model for model in AVAILABLE_MODELS if any(model in installed for installed in installed_models)]
-        
-        if supported_models:
-            print(f"✓ 사용 가능한 모델: {', '.join(supported_models)}")
-        else:
-            print("⚠️ 지원 모델이 설치되어 있지 않습니다. 첫 번째 가용 모델을 사용합니다.")
-            supported_models = [installed_models[0]] if installed_models else []
-        
-        # 사용 가능한 모델로 AVAILABLE_MODELS 업데이트
-        if supported_models:
-            AVAILABLE_MODELS = supported_models
-            
-    except Exception as e:
-        print(f"❌ Ollama 서버 연결 실패: {e}")
-    if OLLAMA_AVAILABLE:
-        try:
-            ollama_models = ollama.list()
-            available_models = [model['name'] for model in ollama_models.get('models', [])]
-            print("✓ Ollama 서버 연결 성공")
-            
-            # 지원되는 모델 선별
-            for model_name in AVAILABLE_MODELS:
-                if model_name in available_models:
-                    supported_models.append(model_name)
-            
-            if supported_models:
-                print(f"✓ 사용 가능한 모델: {', '.join(supported_models)}")
-            else:
-                print("⚠️ 지원 모델이 설치되어 있지 않습니다. 첫 번째 가용 모델을 사용합니다.")
-                supported_models = [available_models[0]] if available_models else []
-            
-            # 사용 가능한 모델로 AVAILABLE_MODELS 업데이트
-            if supported_models:
-                AVAILABLE_MODELS = supported_models
-                
-        except Exception as e:
-            print(f"❌ Ollama 서버 연결 실패: {e}")
-            print("⚠️ RAG 시스템을 오프라인 모드로 실행합니다. 일부 기능이 제한됩니다.")
-    else:
-        print("⚠️ Ollama 모듈을 찾을 수 없어 모델 검색을 건너뜁니다.")
-        print("⚠️ 제한된 기능으로 실행합니다.")
-    
-    # 사용 가능한 모델이 없으면 기본 모델 하나만 사용
-    if not AVAILABLE_MODELS:
-        AVAILABLE_MODELS = ["gemma3:4b"]
-        print(f"⚠️ 사용 가능한 모델이 없어 기본값으로 {AVAILABLE_MODELS[0]}만 사용합니다.")
     
     # 명령줄 인수 가져오기
     args = parser.parse_args()
@@ -1467,8 +1294,11 @@ def main():
             results = {}
             auto_evaluations = {}
             
-            for i, model in enumerate(AVAILABLE_MODELS):
-                print(f"\n📌 [{i+1}/{len(AVAILABLE_MODELS)}] {model} 모델로 답변 생성 중...")
+            # 지정된 모델이 있으면 해당 모델만 사용
+            models_to_use = [args.model] if args.model else AVAILABLE_MODELS
+            
+            for i, model in enumerate(models_to_use):
+                print(f"\n📌 [{i+1}/{len(models_to_use)}] {model} 모델로 답변 생성 중...")
                 result = rag.answer(query, model, context)
                 answer = result["answer"]
                 results[model] = answer
@@ -1614,20 +1444,6 @@ def streamlit_main():
     evaluator = ModelEvaluator()
     auto_evaluator = AutoEvaluator(model_name="gemma3:12b")
     auto_question_generator = AutoQuestionGenerator(model_name="gemma3:12b")
-    
-    # Ollama 서버 연결 확인
-    try:
-        response = requests.get(f"{OLLAMA_API_BASE}/tags")
-        response.raise_for_status()
-        models = response.json().get("models", [])
-        installed_models = [model.get("name") for model in models]
-        available_models = [model for model in AVAILABLE_MODELS if any(model in installed for installed in installed_models)]
-        if not available_models:
-            st.error("❌ 사용 가능한 모델이 없습니다.")
-            return
-    except Exception as e:
-        st.error(f"❌ Ollama 서버 연결 실패: {e}")
-        return
     
     # 질문 응답 탭
     with tab1:
@@ -2517,6 +2333,8 @@ if __name__ == "__main__":
     parser.add_argument("--auto-eval", action="store_true", help="자동 평가 활성화")
     parser.add_argument("--auto-test", action="store_true", help="자동 테스트 실행")
     parser.add_argument("--num-questions", type=int, default=5, help="자동 테스트 질문 수")
+    parser.add_argument("--reuse-index", action="store_true", help="이미 초기화된 인덱스 재사용")
+    parser.add_argument("--model", type=str, help="사용할 모델 지정 (예: gemma3:1b)")
 
     args = parser.parse_args()
     
