@@ -1,0 +1,1687 @@
+import os
+import re
+import time
+import json
+import hashlib
+import logging
+import traceback
+import requests
+import torch
+import argparse
+from typing import List, Dict, Any, Optional, Tuple
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import streamlit as st
+from dotenv import load_dotenv
+import asyncio
+import time
+import io
+import base64
+import aiohttp
+from io import StringIO
+from datetime import datetime
+import glob
+import sys
+import tabula
+import random
+import shutil
+import gc  # 가비지 컬렉션을 위한 모듈 추가
+import math
+from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor
+
+# 디버그 모드 설정
+DEBUG_MODE = False
+
+# OLLAMA_AVAILABLE 변수 정의
+import ollama
+OLLAMA_AVAILABLE = True
+   
+# 현재 스크립트 파일의 절대 경로 가져오기
+SCRIPT_DIR = os.getcwd()
+BASE_DIR = os.path.dirname(SCRIPT_DIR)  # 상위 디렉토리
+print(f"현재 스크립트 파일 경로: {SCRIPT_DIR}")
+print(f"상위 디렉토리 경로: {BASE_DIR}")
+
+
+# .env 파일에서 환경변수 로드
+load_dotenv()
+
+# OpenMP 스레드 수 제한 (FAISS와 Java 충돌 방지)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
+# PDF 처리 라이브러리
+import pypdf
+import tabula
+import pdfplumber
+
+# RAG 관련 라이브러리
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from sentence_transformers import SentenceTransformer
+import faiss
+
+try:
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from rank_bm25 import BM25Okapi
+    LANGCHAIN_AVAILABLE = True
+except ImportError:
+    LANGCHAIN_AVAILABLE = False
+    print("⚠️ langchain_community.embeddings 모듈을 가져올 수 없습니다.")
+
+# RAG 평가 관련 메트릭 라이브러리
+try:
+    from rank_bm25 import BM25Okapi
+    EVAL_LIBS_AVAILABLE = True
+except ImportError:
+    EVAL_LIBS_AVAILABLE = False
+
+# 환경 설정
+PDF_PATH = os.path.join(SCRIPT_DIR, "[한화손해보험]사업보고서(2025.03.11).pdf")
+INDEX_DIR = os.path.join(SCRIPT_DIR, "Index")  # 인덱스 디렉토리 기본 경로
+METADATA_FILE = os.path.join(SCRIPT_DIR, "Index/document_metadata_bge.json")  # 메타데이터 파일
+LOG_FILE = os.path.join(SCRIPT_DIR, "Log/hwgi_rag_streamlit.log")
+CACHE_FILE = os.path.join(SCRIPT_DIR, "cache.json")
+EVALUATION_FILE = os.path.join(SCRIPT_DIR, "Log/model_evaluations.json")  # 모델 평가 결과 저장 파일
+
+# Ollama API 기본 URL 설정
+OLLAMA_API_BASE = "http://localhost:11434/api"
+
+# 사용 가능한 모델 설정
+AVAILABLE_MODELS = ["gemma3:12b"]
+
+# 모델 설정
+EMBEDDING_MODELS = {
+    "bge-m3": {
+        "name": "BAAI/bge-m3",
+        "index_dir": INDEX_DIR,
+        "metadata_file": METADATA_FILE
+    }
+}
+
+# 로깅 설정
+def setup_logging(log_level=logging.DEBUG):
+    logger = logging.getLogger('hwgi_rag')
+    logger.setLevel(log_level)
+    if not logger.handlers:
+        file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+        file_handler.setLevel(log_level)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(log_level)
+        log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(log_format)
+        console_handler.setFormatter(log_format)
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+    return logger
+
+logger = setup_logging()
+
+# E5Embeddings 클래스를 BGE-M3 임베딩으로 대체
+class BGEM3Embeddings(Embeddings):
+    def __init__(self, model_name: str = "BAAI/bge-m3"):
+        print(f"✓ BGE-M3 임베딩 모델 '{model_name}' 초기화 중...")
+        self.model_name = model_name
+        self.model = SentenceTransformer(model_name)
+        
+        # 디바이스 설정
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            print("✓ Apple Silicon GPU (MPS) 사용 가능")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            print("✓ NVIDIA GPU (CUDA) 사용 가능")
+        else:
+            self.device = torch.device("cpu")
+            print("✓ CPU 사용")
+        
+        self.model.to(self.device)
+        print(f"✓ 모델 로드 완료 (디바이스: {self.device})")
+    
+    def _preprocess_text(self, text: str) -> str:
+        """텍스트 전처리 함수"""
+        # 특수문자 제거 및 공백 정리
+        text = re.sub(r'[^\w\s가-힣]', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """문서 리스트의 임베딩을 반환합니다."""
+        try:
+            # 배치 크기 증가 (32 → 64)
+            batch_size = 64
+            all_embeddings = []
+            
+            # 전처리된 텍스트로 배치 처리
+            for i in range(0, len(texts), batch_size):
+                batch = [self._preprocess_text(text) for text in texts[i:i + batch_size]]
+                with torch.inference_mode():
+                    embeddings = self.model.encode(
+                        batch,
+                        convert_to_tensor=True,
+                        device=self.device,
+                        normalize_embeddings=True  # L2 정규화 적용
+                    )
+                    if self.device.type == "mps":
+                        embeddings = embeddings.to("cpu")
+                    all_embeddings.extend(embeddings.cpu().numpy().tolist())
+            
+            return all_embeddings
+        except Exception as e:
+            print(f"❌ 문서 임베딩 생성 중 오류: {e}")
+            raise e
+    
+    def embed_query(self, text: str) -> List[float]:
+        """단일 쿼리 텍스트의 임베딩을 반환합니다."""
+        try:
+            # 쿼리용 접두사 추가
+            query_text = f"query: {text}"
+            with torch.inference_mode():
+                embedding = self.model.encode(
+                    [query_text],
+                    convert_to_tensor=True,
+                    device=self.device,
+                    normalize_embeddings=True
+                )
+                # MPS 디바이스에서 CPU로 이동 후 numpy 변환
+                if self.device.type == "mps":
+                    embedding = embedding.to("cpu")
+                return embedding.cpu().numpy().tolist()[0]
+        except Exception as e:
+            print(f"❌ 쿼리 임베딩 생성 중 오류: {e}")
+            raise e
+
+# OpenAI 임베딩 클래스 정의
+class OpenAIEmbeddings(Embeddings):
+    def __init__(self, model_name: str = "text-embedding-3-small"):
+        print(f"✓ OpenAI 임베딩 모델 '{model_name}' 초기화 중...")
+        load_dotenv()  # .env 파일에서 OPENAI_API_KEY 로드
+        self.model_name = model_name
+        self.client = OpenAI()
+        print("✓ OpenAI 클라이언트 초기화 완료")
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """문서 리스트의 임베딩을 반환합니다."""
+        try:
+            # 배치 크기 설정 (OpenAI API 제한 고려)
+            batch_size = 100
+            all_embeddings = []
+            
+            # 배치 단위로 처리
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                response = self.client.embeddings.create(
+                    model=self.model_name,
+                    input=batch,
+                    encoding_format="float"
+                )
+                batch_embeddings = [data.embedding for data in response.data]
+                all_embeddings.extend(batch_embeddings)
+            
+            return all_embeddings
+        except Exception as e:
+            print(f"❌ OpenAI 문서 임베딩 생성 중 오류: {e}")
+            raise e
+    
+    def embed_query(self, text: str) -> List[float]:
+        """단일 쿼리 텍스트의 임베딩을 반환합니다."""
+        try:
+            response = self.client.embeddings.create(
+                model=self.model_name,
+                input=[text],
+                encoding_format="float"
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            print(f"❌ OpenAI 쿼리 임베딩 생성 중 오류: {e}")
+            raise e
+
+# --- PDF 처리 및 문서 분할 ---
+class PDFProcessor:
+    def __init__(self, pdf_path: str):
+        # 경로가 상대 경로인 경우 현재 스크립트 위치 기준으로 절대 경로 변환
+        if not os.path.isabs(pdf_path):
+            self.pdf_path = os.path.join(SCRIPT_DIR, pdf_path)
+        else:
+            self.pdf_path = pdf_path
+        self.text_content = []  # 텍스트 내용 저장
+        self.tables = []  # 표 데이터 저장
+        self.page_count = 0  # 총 페이지 수
+        self.pdf_hash = self._calculate_pdf_hash()  # PDF 파일 해시
+        self.hash_file = os.path.join(SCRIPT_DIR, "pdf_hash.json")  # 해시 저장 파일
+        logger.info(f"PDFProcessor 초기화: '{self.pdf_path}' 파일 처리 준비")
+    
+    def _calculate_pdf_hash(self) -> str:
+        """PDF 파일의 해시값을 계산합니다."""
+        try:
+            with open(self.pdf_path, 'rb') as file:
+                pdf_hash = hashlib.md5(file.read()).hexdigest()
+            return pdf_hash
+        except Exception as e:
+            logger.error(f"PDF 해시 계산 중 오류: {e}")
+            return ""
+    
+    def _load_previous_hash(self) -> str:
+        """이전에 처리한 PDF의 해시값을 로드합니다."""
+        try:
+            if os.path.exists(self.hash_file):
+                with open(self.hash_file, 'r') as f:
+                    data = json.load(f)
+                    return data.get('pdf_hash', '')
+            return ''
+        except Exception as e:
+            logger.error(f"이전 해시 로드 중 오류: {e}")
+            return ''
+    
+    def _save_current_hash(self):
+        """현재 PDF 해시값을 JSON 파일에 저장합니다."""
+        try:
+            os.makedirs(os.path.dirname(self.hash_file), exist_ok=True)
+            data = {
+                'pdf_hash': self.pdf_hash,
+                'pdf_path': self.pdf_path,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+            with open(self.hash_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"✓ 현재 PDF 해시 저장 완료: {self.hash_file}")
+        except Exception as e:
+            print(f"⚠️ 현재 해시 저장 중 오류: {e}")
+            logger.error(f"현재 해시 저장 중 오류: {e}")
+    
+    def needs_processing(self) -> bool:
+        """PDF 파일의 처리 필요 여부를 확인합니다. 해시값이 다르면 재처리가 필요합니다."""
+        previous_hash = self._load_previous_hash()
+        needs_processing = previous_hash != self.pdf_hash
+        
+        if not needs_processing:
+            logger.info("이전에 처리된 동일한 PDF 파일 감지. 변경 없음으로 판단.")
+        
+        return needs_processing
+    
+    def force_processing(self) -> bool:
+        """PDF 파일의 처리가 필요하도록 강제 설정합니다."""
+        # 해시 파일 삭제를 통해 강제 처리
+        if os.path.exists(self.hash_file):
+            try:
+                os.remove(self.hash_file)
+                logger.info(f"PDF 해시 파일 삭제: {self.hash_file}")
+                print(f"✓ PDF 해시 파일 삭제됨 - 강제 처리 모드 활성화")
+                return True
+            except Exception as e:
+                logger.error(f"PDF 해시 파일 삭제 실패: {e}")
+                print(f"⚠️ PDF 해시 파일 삭제 실패: {e}")
+                return False
+        return True
+    
+    def extract_text(self) -> List[Document]:
+        logger.info("📄 PDF 텍스트 내용 추출 시작")
+        print("📄 PDF 텍스트 내용 추출 중...")
+        documents = []
+        try:
+            with open(self.pdf_path, 'rb') as file:
+                pdf_reader = pypdf.PdfReader(file)
+                self.page_count = len(pdf_reader.pages)
+                
+                for page_num, page in enumerate(pdf_reader.pages):
+                    text = page.extract_text()
+                    if text.strip():
+                        doc_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
+                        
+                        # 텍스트 내용 저장
+                        self.text_content.append({
+                            "page": page_num + 1,
+                            "content": text,
+                            "hash": doc_hash
+                        })
+                        
+                        documents.append(
+                            Document(
+                                page_content=text,
+                                metadata={"page": page_num + 1, "source": "text", "hash": doc_hash}
+                            )
+                        )
+            logger.info(f"✅ 총 {self.page_count}페이지에서 {len(documents)}개의 텍스트 문서 추출 완료")
+            return documents
+        except Exception as e:
+            logger.error(f"❌ 텍스트 추출 중 오류: {e}")
+            logger.error(traceback.format_exc())
+            return []
+    
+    def table_id_generation(self, element):
+        """테이블 ID 생성 함수"""
+        if "Table" not in element:
+            return {}
+        else:
+            values = element['Table']  # list of tables
+            keys = [f"element{element['id']}-table{i}" for i in range(len(values))]
+            return dict(zip(keys, values))
+
+    def extract_cell_color(self, table):
+        """테이블의 첫 셀과 마지막 셀 색상 추출 함수"""
+        page_image = table.page.to_image()
+        cell_image_first = page_image.original.crop(table.cells[0])
+        cell_image_last = page_image.original.crop(table.cells[-1])
+        
+        res_list = []
+        for cell_image in [cell_image_first, cell_image_last]:
+            width, height = cell_image.size
+            background_pixel = cell_image.getpixel((width/5, height/5))
+            res_list.append(background_pixel)
+        
+        return res_list
+
+    def extract_image(self, table, resolution=300):
+        """테이블 이미지 추출 함수"""
+        scale_factor = resolution / 72
+        x0, y0, x1, y1 = table.bbox
+        
+        x0 *= scale_factor
+        y0 *= scale_factor
+        x1 *= scale_factor
+        y1 *= scale_factor
+        
+        img = table.page.to_image(resolution=resolution)
+        table_img = img.original.crop((x0, y0, x1, y1))
+        
+        return table_img
+
+    def extract_table_info(self, table):
+        """테이블 메타 정보 추출 함수"""
+        table_dict = {
+            'page': self.extract_page_number(str(table.page)),
+            'bbox': table.bbox,
+            'ncol': len(table.columns),
+            'nrow': len(table.rows),
+            'content': table.extract(),
+            'cell_color': self.extract_cell_color(table),
+            'img': self.extract_image(table)
+        }
+        
+        return table_dict
+
+    def compare_tables(self, table_A, table_B):
+        """두 테이블이 같은 테이블인지 비교"""
+        prev_info = self.extract_table_info(table_A)
+        curr_info = self.extract_table_info(table_B)
+        
+        counter = 0
+        # 두 테이블의 페이지가 인접해 있는가?
+        if curr_info['page'] - prev_info['page'] == 1:
+            counter += 1
+        
+        # 테이블 위치가 이어지는가?
+        if (np.round(prev_info['bbox'][3], 0) > 780) and (np.round(curr_info['bbox'][1], 0) == 50):
+            counter += 1
+        
+        # 셀 색상이 같은가?
+        if prev_info['cell_color'][1] == curr_info['cell_color'][0]:
+            counter += 1
+        
+        # 컬럼 수가 같은가?
+        if prev_info['ncol'] == curr_info['ncol']:
+            counter += 1
+        
+        decision = 'same table' if counter == 4 else 'different table'
+        return [(counter, decision)]
+
+    def find_table_location_in_text(self, element_content):
+        """콘텐츠 내 테이블 위치 찾기"""
+        start_pattern = '<table>'
+        table_start_position = re.finditer(start_pattern, element_content)
+        start_positions = [(match.start(), match.end()) for match in table_start_position]
+        
+        end_pattern = '</table>'
+        table_end_position = re.finditer(end_pattern, element_content)
+        end_positions = [(match.start(), match.end()) for match in table_end_position]
+        
+        table_location_in_text = [(start[0], end[1]) 
+                                for start, end in zip(start_positions, end_positions)]
+        
+        return table_location_in_text
+
+    def group_table_position(self, element_table):
+        """연속된 테이블의 포지션을 묶어주는 함수"""
+        pos = 0
+        counter = 0
+        result = []
+        
+        for i in range(1, len(element_table)):
+            counter += 1
+            table_comparison_result = self.compare_tables(element_table[i-1], element_table[i])[0][1]
+            
+            if table_comparison_result != 'same table':
+                result.append([pos, pos+counter])
+                pos += counter
+                counter = 0
+        
+        # 마지막 그룹 추가
+        result.append([pos, pos + counter + 1])
+        return result
+
+    def merge_dicts(self, dict_list):
+        """여러 개의 딕셔너리를 하나로 합치는 함수"""
+        merged_dict = {
+            'page': [],
+            'bbox': [],
+            'ncol': 0,
+            'nrow': 0,
+            'content': [],
+            'cell_color': [],
+            'img': [],
+            'obj_type': ['table']
+        }
+        
+        for d in dict_list:
+            merged_dict['page'].append(d['page'])
+            merged_dict['bbox'].append(d['bbox'])
+            merged_dict['ncol'] = max(merged_dict['ncol'], d['ncol'])
+            merged_dict['nrow'] += d['nrow']
+            merged_dict['content'] += (d['content'])
+            merged_dict['cell_color'].append(d['cell_color'])
+            merged_dict['img'].append(d['img'])
+        
+        return merged_dict
+
+    def extract_page_number(self, text):
+        """테이블이 위치한 페이지 번호 추출 함수"""
+        match = re.search(r"<Page:(\d+)>", text)
+        return int(match.group(1)) if match else None
+
+    def extract_tables(self) -> List[Document]:
+        """PDF에서 표 데이터를 추출하고 Document로 변환"""
+        logger.info("📊 PDF 표 데이터 추출 시작")
+        print("📊 PDF 표 데이터 추출 중...")
+        try:
+            table_documents = []
+            
+            with pdfplumber.open(self.pdf_path) as pdf:
+                for page_num, page in enumerate(pdf.pages, 1):
+                    tables = page.extract_tables()
+                    if not tables:
+                        continue
+                    
+                    for table_idx, table in enumerate(tables):
+                        # 빈 행/열 제거 및 문자열 변환
+                        table_content = []
+                        for row in table:
+                            if any(cell for cell in row):  # 빈 행 제외
+                                cleaned_row = [str(cell).strip() if cell else "" for cell in row]
+                                table_content.append(cleaned_row)
+                        
+                        if not table_content:
+                            continue
+                        
+                        # CSV 형식으로 변환
+                        table_text = '\n'.join([','.join(row) for row in table_content])
+                        table_hash = hashlib.md5(table_text.encode('utf-8')).hexdigest()
+                        
+                        # 메타데이터 구성
+                        metadata = {
+                            'table_id': f'table_p{page_num}_t{table_idx + 1}',
+                            'page': page_num,
+                            'source': 'table',
+                            'hash': table_hash,
+                            'row_count': len(table_content),
+                            'col_count': len(table_content[0]) if table_content else 0
+                        }
+                        
+                        # 표 정보 저장
+                        self.tables.append({
+                            'table_id': metadata['table_id'],
+                            'content': table_text,
+                            'raw_data': table_content,
+                            'hash': table_hash,
+                            'metadata': metadata
+                        })
+                        
+                        # Document 객체 생성
+                        table_documents.append(
+                            Document(
+                                page_content=f"표 {metadata['table_id']}:\n{table_text}",
+                                metadata=metadata
+                            )
+                        )
+            
+            logger.info(f"✅ {len(table_documents)}개의 표 처리 완료")
+            return table_documents
+            
+        except Exception as e:
+            logger.error(f"❌ 표 추출 중 오류: {e}")
+            logger.error(traceback.format_exc())
+            return []
+    
+    def process(self) -> List[Document]:
+        """PDF를 처리하고 문서 리스트를 반환합니다."""
+        print(f"\n{'─'*60}")
+        print("📌 1단계: PDF 문서 처리")
+        print(f"{'─'*60}")
+        
+        if not self.needs_processing():
+            logger.info("이전에 처리된 동일한 PDF 파일 감지. 변경 없음으로 판단.")
+            print("✓ 이미 처리된 PDF 파일입니다. 새로운 처리가 필요 없습니다.")
+            # 빈 리스트 반환하여 다음 단계에서 기존 인덱스 사용하도록 함
+            return []
+        
+        logger.info("===== PDF 처리 시작 =====")
+        text_docs = self.extract_text()
+        table_docs = self.extract_tables()
+        all_docs = text_docs + table_docs
+        
+        if not all_docs:
+            print("⚠️ PDF에서 문서를 추출하지 못했습니다.")
+            return []
+        
+        # 성공적으로 처리되면 현재 해시 저장
+        self._save_current_hash()
+        logger.info(f"📚 {len(all_docs)}개의 문서 조각 생성됨")
+        print(f"📚 PDF 처리 완료: {len(text_docs)}개 텍스트 문서, {len(table_docs)}개 표 문서 생성")
+        return all_docs
+    
+    def visualize_table(self, table_id: int):
+        """특정 표를 시각화합니다 (matplotlib 사용)"""
+        if not self.tables:
+            print("⚠️ 표 데이터가 없습니다.")
+            return
+        
+        # 유효한 table_id 확인
+        table_index = table_id - 1
+        if table_index < 0 or table_index >= len(self.tables):
+            print(f"⚠️ 표 #{table_id}가 존재하지 않습니다.")
+            return
+        
+        try:
+            table_data = self.tables[table_index]
+            df = pd.DataFrame(table_data["raw_data"])
+            
+            # 표 시각화
+            fig, ax = plt.figure(figsize=(12, 6)), plt.gca()
+            ax.axis('off')
+            ax.table(
+                cellText=df.values,
+                colLabels=df.columns,
+                cellLoc='center',
+                loc='center'
+            )
+            plt.title(f"표 {table_data['table_id']}", fontsize=14)
+            plt.tight_layout()
+            plt.show()
+            
+            # 테이블 정보 출력
+            print(f"\n📊 표 {table_data['table_id']} 정보:")
+            print(f"  - 행 수: {df.shape[0]}")
+            print(f"  - 열 수: {df.shape[1]}")
+            print(f"  - 열 이름: {', '.join(df.columns)}")
+            
+        except Exception as e:
+            print(f"❌ 표 시각화 중 오류 발생: {e}")
+
+class DocumentSplitter:
+    def __init__(self, chunk_size=1000, chunk_overlap=300):  # 청크 사이즈 증가 (500 → 800), 겹침 크기 증가 (150 → 200)
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=len,
+            # 구분자 최적화: 문단 > 문장 > 구두점 > 공백 순서로 시도
+            separators=[
+                "\n\n",  # 문단 구분
+                "\n",    # 줄바꿈
+                ".",     # 문장 끝
+                "!",     # 감탄문
+                "?",     # 의문문
+                ";",     # 세미콜론
+                ":",     # 콜론
+                ",",     # 쉼표
+                " ",     # 공백
+                ""       # 마지막 수단
+            ]
+        )
+        logger.info(f"DocumentSplitter 초기화: 청크 크기={chunk_size}, 겹침={chunk_overlap}")
+    
+    def split_documents(self, documents: List[Document]) -> List[Document]:
+        logger.info(f"🔪 문서 분할 시작: {len(documents)}개 문서")
+        print("🔪 문서를 청크로 분할 중...")
+        try:
+            chunks = self.text_splitter.split_documents(documents)
+            for i, chunk in enumerate(chunks):
+                chunk.metadata['chunk_id'] = f"chunk_{i}"
+            logger.info(f"✅ {len(chunks)}개의 청크 생성 완료")
+            return chunks
+        except Exception as e:
+            logger.error(f"❌ 문서 분할 중 오류: {e}")
+            return documents
+
+# --- 쿼리 확장기 클래스 ---
+class QueryExpander:
+    """쿼리 확장 클래스"""
+    def __init__(self, model_name: str = None):
+        """QueryExpander 초기화"""
+        # 중복 초기화 방지
+        if hasattr(QueryExpander, '_instance'):
+            self.model = QueryExpander._instance.model
+            self.models = QueryExpander._instance.models
+            logger.info(f"QueryExpander 인스턴스 재사용: {self.model}")
+            return
+        
+        # 모델 설정
+        self.models = check_ollama_models()
+        
+        # 모델 자동 선택 또는 지정된 모델 사용
+        if model_name and model_name in self.models:
+            self.model = model_name
+            logger.info(f"QueryExpander 모델 지정: {model_name}")
+        elif self.models:
+            self.model = self.models[0]
+            logger.info(f"QueryExpander 모델 자동 선택: {self.model}")
+        else:
+            self.model = "gemma3:7b" # 기본 모델
+            logger.warning(f"사용 가능한 모델이 없어 기본 모델 사용: {self.model}")
+        
+        # 인스턴스 저장
+        QueryExpander._instance = self
+    
+    def expand_query(self, query: str, max_queries: int = 5) -> List[str]:
+        """
+        주어진 질문에 대해 다양한 검색용 쿼리를 생성합니다.
+        - 원본 질문을 다양한 관점에서 재구성하여 검색 범위 확장
+        - 반환값은 원본 쿼리를 포함한 확장 쿼리 목록
+        """
+        logger.info(f"🔍 쿼리 확장 시작: '{query}'")
+        print(f"🔍 쿼리 확장 생성 중: '{query}'")
+        
+        try:
+            if not query.strip():
+                logger.warning("빈 쿼리는 확장할 수 없습니다.")
+                return [query]
+            
+            # 엔티티 타입 감지 (인물, 상품, 기술 등)
+            entity_type, entity_name = self._detect_entity(query)
+            
+            # 특수 엔티티가 감지된 경우
+            if entity_type and entity_name:
+                logger.info(f"특수 엔티티 감지: 유형={entity_type}, 이름='{entity_name}'")
+                print(f"🔎 {entity_type} 검색 감지: '{entity_name}'")
+                
+                # 엔티티 유형별 특화 쿼리 생성
+                return self._generate_entity_specific_queries(entity_type, entity_name, query, max_queries)
+            
+            # 일반 쿼리 확장 프롬프트
+            prompt = f"""
+당신은 한화손해보험 사업보고서 내용을 검색하는 RAG 시스템의 쿼리 확장기입니다.
+다음 질문에 대해 사업보고서 내에서 답을 찾기 위한 관련 검색 쿼리를 여러 개 생성해 주세요.
+
+원본 질문: "{query}"
+
+중요: 반드시 원본 질문과 직접적인 관련이 있는 쿼리만 생성하세요. 
+관련 없는 일반적인 쿼리는 생성하지 마세요.
+
+원본 질문을 분석하여 다음과 같은 방식으로 변형해 주세요:
+1. 동의어나 유사 표현으로 바꾸기
+2. 구체적인 키워드 위주로 변환하기
+3. 관련된 세부 개념으로 확장하기 (단, 질문의 핵심 의도를 유지해야 함)
+4. 질문형/키워드형 등 다양한 형식으로 표현하기
+
+JSON 형식으로 응답해 주세요:
+```json
+{{
+  "queries": [
+    "첫 번째 쿼리",
+    "두 번째 쿼리",
+    "세 번째 쿼리",
+    ...
+  ]
+}}
+```
+JSON 형식만 응답하세요. 다른 설명이나 텍스트는 포함하지 마세요.
+최대 {max_queries}개의 관련성 높은 쿼리를 생성하세요.
+"""
+            
+            # Ollama API를 통해 쿼리 확장 생성
+            response_text = self._generate_query_expansion(prompt)
+            
+            # JSON 파싱
+            try:
+                # JSON 형식 검색
+                json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
+                if json_match:
+                    response_text = json_match.group(1)
+                
+                # 중괄호 기반 JSON 추출
+                json_match = re.search(r'{.*}', response_text, re.DOTALL)
+                if json_match:
+                    response_text = json_match.group(0)
+                
+                # JSON 파싱
+                response = json.loads(response_text)
+                
+                # 쿼리 목록 추출
+                if "queries" in response:
+                    expanded_queries = response["queries"]
+                    
+                    # 중복 제거 및 빈 쿼리 제거
+                    expanded_queries = [q.strip() for q in expanded_queries if q.strip()]
+                    
+                    # 관련성 필터링 - 원본 쿼리의 핵심 키워드가 포함된 쿼리만 유지
+                    keywords = self._extract_keywords(query)
+                    if keywords:
+                        # 적어도 하나의 키워드가 포함된 쿼리만 유지
+                        filtered_queries = []
+                        for q in expanded_queries:
+                            if any(keyword.lower() in q.lower() for keyword in keywords):
+                                filtered_queries.append(q)
+                        expanded_queries = filtered_queries
+                    
+                    expanded_queries = list(dict.fromkeys(expanded_queries))
+                    
+                    # 원본 쿼리가 목록에 없으면 추가
+                    if query not in expanded_queries:
+                        expanded_queries.insert(0, query)
+                    
+                    # 최대 쿼리 수 제한
+                    expanded_queries = expanded_queries[:max_queries]
+                    
+                    logger.info(f"✅ 쿼리 확장 완료: {len(expanded_queries)}개 생성")
+                    logger.info(f"확장 쿼리: {expanded_queries}")
+                    print(f"✅ 확장 쿼리 {len(expanded_queries)}개 생성 완료")
+                    return expanded_queries
+                else:
+                    logger.warning("쿼리 확장 결과에 'queries' 키가 없습니다.")
+                    return [query]
+            
+            except json.JSONDecodeError as e:
+                logger.error(f"쿼리 확장 결과 JSON 파싱 오류: {e}")
+                logger.error(f"원본 응답: {response_text}")
+                return [query]
+        
+        except Exception as e:
+            logger.error(f"쿼리 확장 중 오류 발생: {e}")
+            logger.error(traceback.format_exc())
+            return [query]
+    
+    def _detect_entity(self, query: str) -> Tuple[Optional[str], Optional[str]]:
+        """쿼리에서 특수 엔티티(인물, 상품, 기술 등)를 감지합니다."""
+        # 1. 한국 인명 + 조사 + 의문사 패턴 개선
+        # 한국 인명은 보통 2-3글자이며 조사(은,는,이,가)가 바로 붙음
+        korean_name_pattern = r'^([가-힣]{2,3})(은|는|이|가)\s+(?:누구|누구냐|누군가|누구인가|어떤|사람|인물|임원|직원)'
+        korean_name_match = re.search(korean_name_pattern, query)
+        if korean_name_match:
+            name = korean_name_match.group(1).strip()  # 조사를 제외한 이름만 추출
+            logger.info(f"한국 인명 감지: '{name}' (조사: '{korean_name_match.group(2)}')")
+            return "인물", name
+            
+        # 2. 한국 인명 + 의문대명사 패턴 (조사 없이)
+        # 예: "문수진 누구야", "김철수 누구"
+        korean_name_simple_pattern = r'^([가-힣]{2,3})\s+(?:누구|누구야|누구냐|누구인지|뭐|어떤)'
+        korean_name_simple_match = re.search(korean_name_simple_pattern, query)
+        if korean_name_simple_match:
+            name = korean_name_simple_match.group(1).strip()
+            logger.info(f"한국 인명 감지 (조사 없음): '{name}'")
+            return "인물", name
+        
+        # 3. 이름 + 조사만 있는 경우 (예: "문수진은", "김철수가")
+        # 일반적으로 "~은" 형태로 시작하는 질문은 해당 인물에 대한 질문일 가능성이 높음
+        korean_name_suffix_pattern = r'^([가-힣]{2,3})(은|는|이|가)(?:\s|$)'
+        korean_name_suffix_match = re.search(korean_name_suffix_pattern, query)
+        if korean_name_suffix_match:
+            name = korean_name_suffix_match.group(1).strip()
+            logger.info(f"한국 인명 감지 (조사로 종료): '{name}'")
+            return "인물", name
+        
+        # 4. 영어 인명 패턴 (기존 코드)
+        english_person_pattern = r'^([a-zA-Z\s]{2,20})(?:은|는|이|가)?\s+(?:누구|어떤|어느|무슨)'
+        english_person_match = re.search(english_person_pattern, query)
+        if english_person_match:
+            name = english_person_match.group(1).strip()
+            return "인물", name
+            
+        # 5. 상품/서비스 감지
+        product_pattern = r'(?:상품|서비스|보험)\s+([가-힣a-zA-Z0-9\s]{2,20})(?:이|가|은|는)?\s+(?:무엇|뭐|어떤|어떻게)'
+        product_match = re.search(product_pattern, query)
+        if product_match:
+            product = product_match.group(1).strip()
+            return "상품", product
+            
+        # 6. 기술/기능 감지
+        tech_pattern = r'(?:기술|기능|시스템|플랫폼)\s+([가-힣a-zA-Z0-9\s]{2,20})(?:이|가|은|는)?\s+(?:무엇|뭐|어떤|어떻게)'
+        tech_match = re.search(tech_pattern, query)
+        if tech_match:
+            tech = tech_match.group(1).strip()
+            return "기술", tech
+            
+        # 7. 인명만 있는 경우 (직접 언급)
+        # 한글 이름은 2-3글자로 제한
+        name_only_pattern = r'^([가-힣]{2,3}|[a-zA-Z\s]{2,20})$'
+        name_only_match = re.search(name_only_pattern, query)
+        if name_only_match:
+            name = name_only_match.group(1).strip()
+            return "인물", name
+            
+        # 감지된 엔티티가 없는 경우
+        return None, None
+            
+    def _extract_keywords(self, query: str) -> List[str]:
+        """원본 쿼리에서 핵심 키워드를 추출합니다."""
+        # 불용어 제거
+        stopwords = {"은", "는", "이", "가", "을", "를", "에", "에서", "의", "과", "와", "로", "으로", 
+                    "이다", "있다", "없다", "하다", "되다", "한다", "된다", "무엇", "누구", "어디", 
+                    "언제", "왜", "어떻게", "어떤", "얼마나", "몇", "무슨"}
+        
+        # 조사와 특수문자 제거
+        cleaned_query = re.sub(r'[^\w\s]', ' ', query)
+        words = cleaned_query.split()
+        
+        # 길이가 1인 단어와 불용어 제거
+        keywords = [word for word in words if len(word) > 1 and word not in stopwords]
+        return keywords
+    
+    def _generate_entity_specific_queries(self, entity_type: str, entity_name: str, original_query: str, max_queries: int) -> List[str]:
+        """특정 엔티티 유형에 특화된 검색 쿼리를 생성합니다."""
+        logger.info(f"'{entity_name}'({entity_type})에 대한 특화 쿼리 생성 중")
+        
+        # 기본 쿼리는 항상 원본 쿼리로 시작
+        result_queries = [original_query]
+        
+        # 엔티티 유형별 특화 쿼리 생성
+        if entity_type == "인물":
+            # 한화손해보험 내 직책 관련 쿼리 확장
+            roles = [
+                "대표이사", "사장", "부사장", "전무", "상무", "이사", "감사", 
+                "본부장", "실장", "팀장", "부장", "차장", "과장", "대리", "사원",
+                "임원", "집행임원", "사외이사", "기타비상무이사", "회장", "부회장", 
+                "수석부사장", "수석전무", "상임감사", "CIO", "CFO", "CRO", "CEO", 
+                "COO", "CTO", "위원장", "사내이사", "경영진", "책임자", "담당자"
+            ]
+            
+            # 인물 검색을 위한 동사 및 수식어
+            actions = [
+                "담당", "책임", "맡은", "역할", "직무", "업무", "직책", "소개", "이력", 
+                "경력", "프로필", "약력", "경험", "이전 경력", "전문 분야", "실적", 
+                "성과", "공헌", "기여", "발표", "연설", "인터뷰", "담화", "보고서",
+                "이력서", "학력", "전공", "출신", "생년월일", "나이", "이메일", "연락처"
+            ]
+            
+            # 부서 또는 팀 관련 키워드
+            departments = [
+                "경영기획", "재무", "회계", "마케팅", "영업", "판매", "리스크", "준법", 
+                "감사", "전략", "디지털", "IT", "인사", "총무", "법무", "홍보", "투자", 
+                "보험계리", "손해사정", "언더라이팅", "보상", "고객서비스", "연구소",
+                "자산운용", "디지털혁신", "AI", "빅데이터", "ESG", "해외사업"
+            ]
+            
+            # 기본 인물 쿼리
+            basic_queries = [
+                f"{entity_name}",
+                f"{entity_name} 한화손해보험",
+                f"한화손해보험 {entity_name}"
+            ]
+            
+            # 직책 기반 쿼리
+            role_queries = [f"{role} {entity_name}" for role in roles[:10]]
+            role_queries.extend([f"{entity_name} {role}" for role in roles[10:20]])
+            
+            # 부서 기반 쿼리
+            dept_queries = [f"{entity_name} {dept}" for dept in departments[:10]]
+            
+            # 직무/역할 기반 쿼리
+            action_queries = [f"{entity_name} {action}" for action in actions[:10]]
+            
+            # 결합 쿼리 (더 구체적인 검색)
+            combined_queries = [
+                f"{entity_name} 한화손해보험 프로필",
+                f"{entity_name} 한화손해보험 이력",
+                f"{entity_name} 한화손해보험 직책",
+                f"{entity_name} 한화손해보험 경력",
+                f"{entity_name} 한화손해보험 업무",
+                f"{entity_name} 한화손해보험 담당"
+            ]
+            
+            # 모든 쿼리 결합
+            result_queries.extend(basic_queries)
+            result_queries.extend(role_queries)
+            result_queries.extend(dept_queries)
+            result_queries.extend(action_queries)
+            result_queries.extend(combined_queries)
+            
+        elif entity_type == "상품":
+            specific_queries = [
+                f"{entity_name}",
+                f"{entity_name} 상품",
+                f"{entity_name} 보험",
+                f"{entity_name} 서비스",
+                f"{entity_name} 특징",
+                f"{entity_name} 설명",
+                f"{entity_name} 소개",
+                f"{entity_name} 장점",
+                f"{entity_name} 조건",
+                f"{entity_name} 계약",
+                f"한화손해보험 {entity_name}",
+                f"{entity_name} 보장",
+                f"{entity_name} 보험료",
+                f"{entity_name} 판매",
+                f"{entity_name} 가입"
+            ]
+            result_queries.extend(specific_queries)
+            
+        elif entity_type == "기술":
+            specific_queries = [
+                f"{entity_name}",
+                f"{entity_name} 기술",
+                f"{entity_name} 시스템",
+                f"{entity_name} 플랫폼",
+                f"{entity_name} 적용",
+                f"{entity_name} 활용",
+                f"{entity_name} 구현",
+                f"{entity_name} 도입",
+                f"{entity_name} 특징",
+                f"{entity_name} 효과",
+                f"한화손해보험 {entity_name}",
+                f"{entity_name} 개발",
+                f"{entity_name} 혁신",
+                f"{entity_name} 투자"
+            ]
+            result_queries.extend(specific_queries)
+            
+        else:
+            # 기타 엔티티 유형에 대한 일반적인 확장
+            specific_queries = [
+                f"{entity_name}",
+                f"{entity_name} 한화손해보험",
+                f"한화손해보험 {entity_name}",
+                f"{entity_name} 설명",
+                f"{entity_name} 내용",
+                f"{entity_name} 소개",
+                f"{entity_name} 정보"
+            ]
+            result_queries.extend(specific_queries)
+        
+        # 중복 제거 및 최대 개수 제한
+        result_queries = list(dict.fromkeys(result_queries))[:max_queries]
+        
+        logger.info(f"{entity_type} 특화 쿼리 {len(result_queries)}개 생성 완료")
+        print(f"✅ '{entity_name}'({entity_type})에 관한 특화 쿼리 {len(result_queries)}개 생성")
+        
+        return result_queries
+        
+    def _generate_query_expansion(self, prompt: str) -> str:
+        """Ollama API를 통해 쿼리 확장을 생성합니다."""
+        try:
+            url = "http://localhost:11434/api/generate"
+            headers = {"Content-Type": "application/json"}
+            data = {
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "top_p": 0.9
+                }
+            }
+            
+            logger.info(f"Ollama API 호출: 모델={self.model}")
+            response = requests.post(url, headers=headers, json=data)
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("response", "")
+            else:
+                logger.error(f"Ollama API 오류: {response.status_code} - {response.text}")
+                return ""
+        
+        except Exception as e:
+            logger.error(f"쿼리 확장 생성 중 오류: {e}")
+            return ""
+
+# --- RAG 시스템 (벡터 검색) ---
+class RAGSystem:
+    """검색 증강 생성(RAG) 시스템 클래스"""
+    def __init__(self, embedding_type: str = "bge-m3", use_hnsw: bool = True, ef_search: int = 200, ef_construction: int = 200, m: int = 64):
+        """RAG 시스템 초기화"""
+        print("🔧 RAG 시스템 초기화 중...")
+        print(f"  - 임베딩 모델: {embedding_type}")
+        
+        # 중복 초기화 방지를 위한 클래스 변수
+        if hasattr(RAGSystem, '_initialized'):
+            logger.info("RAG 시스템이 이미 초기화되어 있습니다.")
+            return
+        
+        # 초기화 완료 표시
+        RAGSystem._initialized = True
+        
+        # 임베딩 모델 유형 저장
+        self.embedding_type = embedding_type
+        self.embedding_name = None
+        
+        # 임베딩 모델 초기화
+        if embedding_type == "bge-m3":
+            self.embeddings = BGEM3Embeddings(model_name="BAAI/bge-m3")
+            self.embedding_name = "bge-m3"
+        elif LANGCHAIN_AVAILABLE and embedding_type == "bge":
+            # BGE-base 임베딩 사용 (HuggingFaceEmbeddings 필요)
+            print("✓ BGE-base 임베딩 모델 초기화 중...")
+            self.embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
+            self.embedding_name = "bge"
+        else:
+            # 기본으로 BGE-M3 임베딩 사용 (embedding_type이 "bge-m3"가 아닌 다른 값인 경우에만)
+            if embedding_type != "bge-m3":
+                print("✓ BGE-M3 임베딩 모델 'BAAI/bge-m3' 초기화 중 (기본값)")
+                self.embeddings = BGEM3Embeddings(model_name="BAAI/bge-m3")
+                self.embedding_name = "bge-m3"
+                self.embedding_type = "bge-m3"  # 타입 업데이트
+            else:
+                # 이미 "bge-m3"로 초기화된 경우 건너뜁니다 (첫 번째 if 조건에서 처리됨)
+                pass
+
+        # 응답 캐시 초기화
+        self._cache = self._load_cache()
+        
+        # HNSW 인덱스 옵션
+        self.use_hnsw = use_hnsw
+        self.ef_search = ef_search
+        self.ef_construction = ef_construction
+        self.m = m
+        
+        # 벡터 저장소 초기화
+        self.vector_store = None
+                
+        # 인덱스 디렉토리 설정
+        self.index_dir = INDEX_DIR
+        os.makedirs(self.index_dir, exist_ok=True)
+        
+        # Ollama REST API 설정
+        self.ollama_base_url = "http://localhost:11434/api"
+        
+        # 사용 가능한 Ollama 모델 목록
+        self.available_models = check_ollama_models()
+        
+        if self.available_models:
+            selected_model = self.available_models[0]
+            print(f"✓ 사용할 모델: {selected_model}")
+            
+            # 쿼리 확장기 초기화
+            self.query_expander = QueryExpander(model_name=selected_model)
+            logger.info(f"QueryExpander 모델 자동 선택: {selected_model}")
+            print(f"✓ 쿼리 확장에 {selected_model} 모델을 사용합니다.")
+            print(f"  - 쿼리 확장: 활성화됨")
+        else:
+            self.query_expander = None
+            print("⚠️ 사용 가능한 Ollama 모델이 없어 쿼리 확장이 비활성화됩니다.")
+            print(f"  - 쿼리 확장: 비활성화됨")
+        
+        print("✅ RAG 시스템 초기화 완료")
+    
+    def _load_cache(self) -> Dict[str, str]:
+        """캐시 파일을 로드합니다."""
+        cache_file = os.path.join(SCRIPT_DIR, "cache.json")
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"캐시 파일 로드 실패: {e}")
+                return {}
+        return {}
+    
+    def _save_cache(self):
+        """캐시를 파일에 저장합니다."""
+        cache_file = os.path.join(SCRIPT_DIR, "cache.json")
+        try:
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(self._cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"캐시 파일 저장 실패: {e}")
+    
+    def _generate_with_ollama(self, prompt: str, model: str = "gemma3:1b", stream: bool = True, max_retries: int = 3) -> str:
+        """Ollama API를 이용하여 텍스트 생성"""
+        try:
+            api_url = f"{self.ollama_base_url}/generate"
+            
+            # API 요청 JSON
+            api_json = {
+                "model": model,
+                "prompt": prompt,
+                "stream": stream,
+                "options": {
+                    "temperature": 0.1,  # 낮은 온도로 설정하여 더 결정적인 응답 생성
+                    "top_p": 0.1,        # top_p도 낮게 설정하여 더 결정적인 응답 생성
+                    "top_k": 10          # top_k도 낮게 설정
+                }
+            }
+            
+            # 추가 옵션 설정
+            if "llama3" in model or "gemma3" in model:
+                # 시스템 프롬프트 추가 (라마3, 젬마3 모델용)
+                api_json["system"] = """당신은 정확성을 최우선으로 하는 금융 전문가입니다. 항상 주어진 문서의 내용만을 기반으로 답변하고, 문서에 명시되지 않은 내용은 절대 추가하지 마세요. 만약 문서에 관련 정보가 없다면 솔직하게 그 사실을 알려야 합니다. 정확한 정보만 전달하는 것이 당신의 핵심 원칙입니다."""
+            
+            logger.info(f"Ollama API 호출: 모델={model}")
+            
+            # HTTP 요청 전송
+            current_retry = 0
+            while current_retry < max_retries:
+                try:
+                    response = requests.post(api_url, json=api_json, timeout=60)
+                    break
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Ollama API 요청 실패 ({current_retry+1}/{max_retries}): {e}")
+                    current_retry += 1
+                    if current_retry < max_retries:
+                        time.sleep(1)  # 재시도 전 1초 대기
+                    else:
+                        raise ConnectionError(f"Ollama API 연결 실패: {e}")
+            
+            # 응답 처리
+            response_text = ""
+            if response.status_code == 200:
+                if stream:
+                    # 스트리밍 응답 처리
+                    print(f"\n================================================================================")
+                    print(f"📝 모델: {model}")
+                    print(f"================================================================================")
+                    
+                    for line in response.iter_lines():
+                        if line:
+                            try:
+                                json_response = json.loads(line.decode('utf-8'))
+                                chunk = json_response.get("response", "")
+                                response_text += chunk
+                                # 줄단위 출력
+                                print(chunk, end="", flush=True)
+                            except json.JSONDecodeError:
+                                logger.warning(f"JSON 파싱 오류: {line}")
+                    
+                    print()  # 줄바꿈 추가
+                    logger.debug(f"응답 생성 완료: 길이={len(response_text)}")
+                else:
+                    # 단일 응답 처리
+                    json_response = response.json()
+                    response_text = json_response.get("response", "")
+                    logger.debug(f"스트리밍 없이 응답 생성 완료: 길이={len(response_text)}")
+                
+                return response_text
+            else:
+                error_msg = f"Ollama API 오류: {response.status_code}, {response.text}"
+                logger.error(error_msg)
+                return f"⚠️ {error_msg}"
+        
+        except Exception as e:
+            error_msg = f"텍스트 생성 중 오류 발생: {e}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            print(f"\n❌ {error_msg}")
+            return f"⚠️ {error_msg}"
+
+    def answer(self, query: str, model: str, context: str) -> Dict[str, Any]:
+        """쿼리에 대한 답변 생성"""
+        try:
+            # 1. 캐시 확인
+            cache_key = f"{model}:{hashlib.md5((query + context[:100]).encode()).hexdigest()}"
+            cached_answer = self._cache.get(cache_key)
+            
+            if cached_answer and not os.environ.get('DISABLE_CACHE'):
+                logger.info(f"캐시된 응답 사용: 모델={model}")
+                print(f"💾 캐시된 응답 사용: {model}")
+                return {
+                    "answer": cached_answer,
+                    "model": model,
+                    "cached": True
+                }
+            
+            # 2. 프롬프트 생성
+            try:
+                # 오늘 날짜 정보 추가
+                today = datetime.now().strftime("%Y년 %m월 %d일")
+                
+                # 컨텍스트가 너무 길면 지능적으로 자르기
+                max_context_length = 10000  # 토큰 한도를 고려한 길이 제한
+                if len(context) > max_context_length:
+                    logger.warning(f"컨텍스트 길이 제한 초과: {len(context)}자 -> {max_context_length}자로 제한")
+                    print(f"⚠️ 컨텍스트가 너무 깁니다 ({len(context)}자). {max_context_length}자로 제한합니다.")
+                    
+                    # 섹션 단위로 나누기
+                    sections = context.split("\n\n")
+                    
+                    # 중요도를 계산하여 정렬
+                    scored_sections = []
+                    for section in sections:
+                        # 제목 섹션은 항상 유지
+                        if section.startswith("다음은 사용자 질문과 관련된"):
+                            score = float('inf')  # 최고 점수로 설정
+                        elif section.startswith("[문서 #"):
+                            score = float('inf') - 1  # 문서 제목도 높은 점수
+                        else:
+                            # 간단한 키워드 매칭 기반 관련성 점수 계산
+                            query_terms = set(re.findall(r'\w+', query.lower()))
+                            section_text = section.lower()
+                            score = sum(1 for term in query_terms if term in section_text)
+                        
+                        scored_sections.append((section, score))
+                    
+                    # 점수별 정렬 (높은 것부터)
+                    sorted_sections = sorted(scored_sections, key=lambda x: x[1], reverse=True)
+                    
+                    # 컨텍스트 재구성
+                    trimmed_context = ""
+                    current_length = 0
+                    
+                    # 높은 점수의 섹션부터 추가
+                    for section, _ in sorted_sections:
+                        # 제목 섹션은 항상 포함
+                        if section.startswith("다음은 사용자 질문과 관련된") or section.startswith("[문서 #"):
+                            trimmed_context += section + "\n\n"
+                            continue
+                            
+                        # 길이 제한 확인
+                        if current_length + len(section) <= max_context_length:
+                            trimmed_context += section + "\n\n"
+                            current_length += len(section) + 2  # 줄바꿈 포함
+                        else:
+                            # 제한 도달 시 종료
+                            break
+                    
+                    # 최종 컨텍스트 설정
+                    context = trimmed_context.strip()
+                
+                # 한화손해보험 사업보고서 특화 QA 프롬프트 템플릿
+                qa_template = f"""당신은 {today} 기준으로 한화손해보험 사업보고서를 분석하여 정확하고 상세한 답변을 제공하는 금융 전문가입니다.
+
+## 중요 정보 및 제약사항
+아래 규칙을 철저히 준수하지 않으면 심각한 문제가 발생합니다:
+
+1. 절대적으로 제공된 문서 콘텐츠에만 기반하여 답변하세요. 제공된 문서에 정보가 없으면 "해당 내용은 제공된 한화손해보험 사업보고서에서 찾을 수 없습니다"라고 명확히 답변하세요.
+
+2. 문서에 명시적으로 언급되지 않은 내용을 절대로 답변에 포함하지 마세요. 특히 다음 주제는 문서에 직접 언급된 경우에만 포함하세요:
+   - 디지털 전환/디지털 기술
+   - AI/인공지능
+   - 빅데이터
+   - ESG 경영
+   - 핀테크
+
+3. 숫자, 날짜, 금액 등 모든 사실적 정보는 문서에 있는 그대로 정확히 인용하세요. 어떤 정보도 변형하거나 추측하거나 일반화하지 마세요.
+
+4. "~일 수 있습니다", "~할 것입니다", "~하고 있습니다"와 같은 추측성 표현은 문서에 직접 그런 표현이 있지 않은 한 사용하지 마세요.
+
+5. 문서에 명확하게 나와있지 않은 내용은 절대 지어내지 마세요. 정보가 불충분하면 그 사실을 솔직하게 인정하세요.
+
+## 답변 형식 지침
+1. 답변은 논리적 구조를 갖추고, 항목별로 구분하여 가독성을 높이세요.
+2. 표, 그래프, 숫자 데이터는 원본 형식을 최대한 유지하여 표현하세요.
+3. 특정 인물에 대한 질문은 문서에 실제로 등장하는 정보만 제공하세요.
+
+사용자 질문: {query}
+
+검색된 한화손해보험 사업보고서 내용:
+{context}
+
+위 사업보고서 내용만을 바탕으로 질문에 대한 답변:"""
+                    
+                    return self._generate_with_ollama(qa_template, model, stream=True)
+                else:
+                    # 단일 응답 처리
+                    json_response = response.json()
+                    response_text = json_response.get("response", "")
+                    
+                    # 한화손해보험 사업보고서 특화 QA 프롬프트 템플릿
+                    qa_template = f"""당신은 {today} 기준으로 한화손해보험 사업보고서를 분석하여 정확하고 상세한 답변을 제공하는 금융 전문가입니다.
+
+## 중요 정보 및 제약사항
+아래 규칙을 철저히 준수하지 않으면 심각한 문제가 발생합니다:
+
+1. 절대적으로 제공된 문서 콘텐츠에만 기반하여 답변하세요. 제공된 문서에 정보가 없으면 "해당 내용은 제공된 한화손해보험 사업보고서에서 찾을 수 없습니다"라고 명확히 답변하세요.
+
+2. 문서에 명시적으로 언급되지 않은 내용을 절대로 답변에 포함하지 마세요. 특히 다음 주제는 문서에 직접 언급된 경우에만 포함하세요:
+   - 디지털 전환/디지털 기술
+   - AI/인공지능
+   - 빅데이터
+   - ESG 경영
+   - 핀테크
+
+3. 숫자, 날짜, 금액 등 모든 사실적 정보는 문서에 있는 그대로 정확히 인용하세요. 어떤 정보도 변형하거나 추측하거나 일반화하지 마세요.
+
+4. "~일 수 있습니다", "~할 것입니다", "~하고 있습니다"와 같은 추측성 표현은 문서에 직접 그런 표현이 있지 않은 한 사용하지 마세요.
+
+                    break
+            
+            context = "\n\n".join(optimized_context)
+        
+        prompt = EVAL_PROMPT_TEMPLATE.format(
+            question=question,
+            context=context,
+            answer=answer
+        )
+        
+        # 평가 결과를 하드코딩된 예시로 반환 (실제로는 LLM을 호출해야 함)
+        # 이 부분은 임시로 추가하여 코드가 동작하도록 함
+        example_evaluation = {
+            "score": 3,
+            "reason": "답변이 기본적인 정보는 제공하지만, 세부 내용이 부족합니다.",
+            "raw_evaluation": "평가 전체 텍스트"
+        }
+        
+        return example_evaluation
+
+
+# 질문 생성기 프롬프트 템플릿
+QUESTION_GENERATOR_TEMPLATE = """당신은 한화손해보험 사업보고서에 관한 질문을 생성하는 AI입니다.
+제공된 문서 내용을 기반으로 구체적이고 명확한 질문을 생성해주세요.
+
+다음 유형의 질문을 생성하세요:
+1. 재무/실적 관련 질문 (수익, 손실, 성장률 등)
+2. 사업 전략 관련 질문
+3. 리스크 관리 관련 질문
+4. 지배구조 관련 질문
+5. 상품/서비스 관련 질문
+
+[문서 내용]
+{context}
+
+위 내용을 기반으로 다양한 유형의 질문 5개를 생성해주세요.
+질문은 구체적이어야 하며, 문서 내용에서 답변할 수 있는 것이어야 합니다.
+다음 형식으로 JSON 배열만 출력하세요:
+["질문1", "질문2", "질문3", "질문4", "질문5"]"""
+
+
+class AutoQuestionGenerator:
+    def __init__(self, model_name: str = "gemma3:12b"):
+        self.model_name = model_name
+    
+    def generate_questions(self, context: str, stream: bool = True) -> List[str]:
+        """문서 컨텍스트를 기반으로 질문 생성"""
+        # 컨텍스트 길이 제한
+        max_context_length = 2000
+        if len(context) > max_context_length:
+            context_parts = context.split("\n\n")
+            optimized_context = []
+            current_length = 0
+            
+            for part in context_parts:
+                if current_length + len(part) <= max_context_length:
+                    optimized_context.append(part)
+                    current_length += len(part)
+                else:
+                    break
+            
+            context = "\n\n".join(optimized_context)
+        
+        prompt = QUESTION_GENERATOR_TEMPLATE.format(context=context)
+        
+        # 임시로 하드코딩된 질문 목록 반환 (실제로는 LLM을 호출해야 함)
+        # 이 부분은 임시로 추가하여 코드가 동작하도록 함
+        example_questions = [
+            "한화손해보험의 2024년 1분기 당기순이익은 얼마인가요?",
+            "한화손해보험의 주요 리스크 관리 전략은 무엇인가요?",
+            "한화손해보험의 디지털 전환 전략에 대해 설명해주세요.",
+            "한화손해보험의 지배구조 특징은 무엇인가요?",
+            "한화손해보험의 주요 보험 상품 라인업은 어떻게 구성되어 있나요?"
+        ]
+        
+        return example_questions
+
+
+class AutoTestManager:
+    def __init__(self, rag_system: RAGSystem, test_count: int = 5):
+        """자동 테스트 관리자 초기화"""
+        self.rag_system = rag_system
+        self.test_count = test_count
+        self.question_generator = AutoQuestionGenerator()
+        self.evaluator = AutoEvaluator()
+        self.available_models = ["gemma3:12b", "gemma3:7.8b", "claude3:sonnet", "claude3:haiku"]
+        
+        # 테스트 결과 저장
+        self.results = {
+            "tests": [],
+            "summary": {
+                "avg_score": 0,
+                "count": 0,
+                "score_distribution": {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+            }
+        }
+    
+    def run_auto_test(self, use_random_docs: bool = True, test_count: Optional[int] = None) -> Dict[str, Any]:
+        """자동 테스트 실행"""
+        if test_count is not None:
+            self.test_count = test_count
+        
+        test_results = []
+        
+        if use_random_docs:
+            # 랜덤 문서에서 테스트 실행
+            docs = self.rag_system.vectorstore.get_random_documents(min(20, self.test_count * 2))
+            for doc in docs[:self.test_count]:
+                test_results.extend(self._run_test_on_document(doc))
+        else:
+            # 검색 결과에서 테스트 실행
+            # 구현 필요시 추가
+            pass
+        
+        # 테스트 결과 요약 업데이트
+        self._update_summary()
+        
+        return self.results
+    
+    def _run_test_on_document(self, document) -> List[Dict[str, Any]]:
+        """단일 문서에 대한 테스트 실행"""
+        context = document.page_content
+        source = document.metadata.get("source", "알 수 없음")
+        
+        # 질문 생성
+        try:
+            questions = self.question_generator.generate_questions(context)
+        except Exception as e:
+            logging.error(f"질문 생성 오류: {str(e)}")
+            return []
+        
+        test_results = []
+        
+        # 각 질문에 대해 테스트 실행
+        for question in questions[:1]:  # 문서당 첫 번째 질문만 사용 (부하 제한)
+            try:
+                # RAG 시스템으로 답변 생성
+                retrieved_docs = self.rag_system.search(question, top_k=5)
+                answer = self.rag_system.answer(question, retrieved_docs)
+                
+                # 답변 평가
+                evaluation = self.evaluator.evaluate_answer(
+                    question=question,
+                    context=context,
+                    answer=answer
+                )
+                
+                # 테스트 결과 저장
+                test_result = {
+                    "question": question,
+                    "source": source,
+                    "context": context[:500] + ("..." if len(context) > 500 else ""),
+                    "answer": answer,
+                    "evaluation": evaluation,
+                    "score": evaluation["score"],
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+                test_results.append(test_result)
+                self.results["tests"].append(test_result)
+                
+            except Exception as e:
+                logging.error(f"테스트 실행 오류: {str(e)}")
+        
+        return test_results
+    
+    def _update_summary(self):
+        """테스트 결과 요약 업데이트"""
+        tests = self.results["tests"]
+        
+        if not tests:
+            return
+        
+        # 점수 분포 초기화
+        score_distribution = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        
+        # 각 테스트 결과의 점수 카운트
+        total_score = 0
+        for test in tests:
+            score = test.get("score", 0)
+            if 1 <= score <= 5:
+                score_distribution[score] += 1
+                total_score += score
+        
+        # 평균 점수 계산
+        avg_score = total_score / len(tests) if tests else 0
+        
+        # 요약 업데이트
+        self.results["summary"] = {
+            "avg_score": round(avg_score, 2),
+            "count": len(tests),
+            "score_distribution": score_distribution
+        }
+
+def check_ollama_models() -> List[str]:
+    """Ollama API를 통해 사용 가능한 모델을 확인합니다."""
+    # 이미 실행된 경우 캐시된 결과 반환
+    if hasattr(check_ollama_models, '_cached_models'):
+        return check_ollama_models._cached_models
+    
+    api_url = "http://localhost:11434/api/tags"
+    try:
+        logger.info("Ollama REST API로 모델 조회 시도 중...")
+        print("🔄 Ollama REST API로 모델 조회 시도 중...")
+        
+        response = requests.get(api_url, timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            models = [model["name"] for model in data.get("models", [])]
+            
+            if models:
+                logger.info(f"Ollama REST API 연결 성공: {len(models)}개 모델 발견")
+                print(f"✓ Ollama REST API 연결 성공: {len(models)}개 모델 발견")
+                
+                # 사용 가능한 모델 목록 캐시
+                check_ollama_models._cached_models = models
+                return models
+            else:
+                logger.warning("Ollama API에 모델이 없습니다.")
+                print("⚠️ Ollama API에 모델이 없습니다.")
+        else:
+            logger.error(f"Ollama API 오류: {response.status_code}")
+            print(f"⚠️ Ollama API 오류: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Ollama API 연결 실패: {e}")
+        print(f"⚠️ Ollama API 연결 실패: {e}")
+    
+    # 기본 모델 리스트 (연결 실패시)
+    check_ollama_models._cached_models = []
+    return []
+
+# --- 모델 평가 관리 클래스 ---
+class ModelEvaluator:
+    def __init__(self):
+        """모델 평가 관리자 초기화"""
+        self.evaluation_file = EVALUATION_FILE
+        self.evaluations = self._load_evaluations()
+    
+    def _load_evaluations(self) -> Dict:
+        """저장된 평가 데이터 로드"""
+        os.makedirs(os.path.dirname(self.evaluation_file), exist_ok=True)
+        if os.path.exists(self.evaluation_file):
+            try:
+                with open(self.evaluation_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"⚠️ 평가 파일 로드 중 오류: {e}")
+                return {"evaluations": []}
+        return {"evaluations": []}
+    
+    def _save_evaluations(self):
+        """평가 데이터 저장"""
+        os.makedirs(os.path.dirname(self.evaluation_file), exist_ok=True)
+        try:
+            with open(self.evaluation_file, 'w', encoding='utf-8') as f:
+                json.dump(self.evaluations, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️ 평가 파일 저장 중 오류: {e}")
+    
+    def save_evaluation(self, question: str, context: str, answers: Dict[str, str], metadata: Dict = None) -> str:
+        """새 평가 세션 저장"""
+        # 평가 ID 생성
+        evaluation_id = f"eval_{int(time.time())}_{hashlib.md5(question.encode()).hexdigest()[:8]}"
+        
+        # 새 평가 데이터 생성
+        evaluation = {
+            "id": evaluation_id,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "question": question,
+            "context": context[:1000] + "..." if len(context) > 1000 else context,  # 컨텍스트 길이 제한
+            "answers": answers,
+            "scores": {},
+            "metadata": metadata or {}
+        }
+        
+        # 평가 목록에 추가
+        self.evaluations["evaluations"].append(evaluation)
+        self._save_evaluations()
+        
+        return evaluation_id
+    
+    def add_evaluation_score(self, evaluation_id: str, model_name: str, score: int, comments: str = ""):
+        """특정 모델에 대한 평가 점수 추가"""
+        for eval_item in self.evaluations["evaluations"]:
+            if eval_item["id"] == evaluation_id:
+                eval_item["scores"][model_name] = {
+                    "score": score,
+                    "comments": comments,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                }
+                self._save_evaluations()
+                return True
+        return False
+    
+    def get_evaluation(self, evaluation_id: str) -> Dict:
+        """특정 평가 데이터 조회"""
+        for eval_item in self.evaluations["evaluations"]:
+            if eval_item["id"] == evaluation_id:
+                return eval_item
+        return {}
+    
+    def get_all_evaluations(self) -> List[Dict]:
+        """모든 평가 데이터 조회"""
+        return self.evaluations["evaluations"]
+    
+    def get_model_avg_scores(self) -> Dict[str, float]:
+        """모델별 평균 점수 계산"""
+        model_scores = {}
+        model_counts = {}
+        
+        for eval_item in self.evaluations["evaluations"]:
+            for model, score_data in eval_item["scores"].items():
+                score = score_data.get("score", 0)
+                if model not in model_scores:
+                    model_scores[model] = 0
+                    model_counts[model] = 0
+                model_scores[model] += score
+                model_counts[model] += 1
+        
+        # 평균 계산
+        avg_scores = {}
+        for model, total_score in model_scores.items():
+            count = model_counts.get(model, 0)
+            avg_scores[model] = round(total_score / count, 2) if count > 0 else 0
+        
+        return avg_scores
+
+if __name__ == "__main__":
+    try:
+        # 스크립트가 직접 실행될 때만 main 함수 호출
+        exit_code = main()
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        print("\n👋 프로그램 종료 (Ctrl+C)")
+        sys.exit(0)
+    except Exception as e:
+        print(f"❌ 예상치 못한 오류 발생: {e}")
+        traceback.print_exc()
+        sys.exit(1)

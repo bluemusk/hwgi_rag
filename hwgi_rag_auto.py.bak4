@@ -8,7 +8,6 @@ import traceback
 import requests
 import torch
 import argparse
-import sys
 from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
 import numpy as np
@@ -26,15 +25,6 @@ import glob
 
 # 현재 파일 위치 기준 상대 경로 계산을 위한 변수 추가
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# OLLAMA_AVAILABLE 변수 정의
-try:
-    import ollama
-    OLLAMA_AVAILABLE = True
-except ImportError:
-    OLLAMA_AVAILABLE = False
-# 디버그 모드 설정
-DEBUG_MODE = False
-
 BASE_DIR = os.path.dirname(SCRIPT_DIR)  # 상위 디렉토리
 
 # .env 파일에서 환경변수 로드
@@ -67,7 +57,7 @@ except ImportError:
 
 # 환경 설정
 PDF_PATH = os.path.join(SCRIPT_DIR, "[한화손해보험]사업보고서(2025.03.11).pdf")
-INDEX_DIR = os.path.join(SCRIPT_DIR, "Index/faiss_index_bge-m3")  # 인덱스 디렉토리
+INDEX_DIR = os.path.join(SCRIPT_DIR, "Index/faiss_index_bge")  # 인덱스 디렉토리
 METADATA_FILE = os.path.join(SCRIPT_DIR, "Index/document_metadata_bge.json")  # 메타데이터 파일
 LOG_FILE = os.path.join(SCRIPT_DIR, "Log/hwgi_rag_streamlit.log")
 CACHE_FILE = os.path.join(SCRIPT_DIR, "Log/query_cache_streamlit.json")
@@ -77,8 +67,8 @@ EVALUATION_FILE = os.path.join(SCRIPT_DIR, "Log/model_evaluations.json")  # 모�
 OLLAMA_API_BASE = "http://localhost:11434/api"
 
 # 사용 가능한 모델 설정
-# AVAILABLE_MODELS = ["gemma3:4b", "llama3.1:8b", "gemma3:12b"]
-AVAILABLE_MODELS = ["gemma3:12b"]
+AVAILABLE_MODELS = ["gemma3:4b", "llama3.1:8b", "gemma3:12b"]
+
 # 모델 설정
 EMBEDDING_MODELS = {
     "bge-m3": {
@@ -786,9 +776,8 @@ class RAGSystem:
         self.ef_construction = ef_construction
         self.m = m
         
-        # 벡터 저장소 초기화
         self.vector_store = None
-        self.index_dir = os.path.join(SCRIPT_DIR, "Index/faiss_index_bge-m3")
+        self.index_dir = os.path.join(SCRIPT_DIR, "faiss_index")
         self.metadata_file = os.path.join(SCRIPT_DIR, "faiss_metadata.json")
         
         # 캐시 초기화 시도
@@ -1207,66 +1196,6 @@ class RAGSystem:
             logger.error(f"❌ 문서 검색 중 오류: {e}")
             print(f"❌ 문서 검색 중 오류 발생: {e}")
             return []
-            
-    def format_context_for_model(self, docs: List[Document]) -> str:
-        """검색된 문서들을 모델에 전달할 수 있는 형식으로 변환"""
-        formatted_docs = []
-        for doc in docs:
-            page_info = f"[페이지 {doc.metadata.get('page', '불명')}]"
-            formatted_docs.append(f"{page_info} {doc.page_content}")
-        return "\n\n".join(formatted_docs)
-    
-    def answer(self, query: str, model: str, context: str) -> Dict[str, Any]:
-        print(f"\n{'─'*60}")
-        print(f"📌 4단계: 답변 생성 ({model})")
-        print(f"{'─'*60}")
-        
-        # 컨텍스트 길이 제한 및 최적화
-        max_context_length = 2000  # 로컬 모델의 한계를 고려한 컨텍스트 길이
-        context_parts = context.split("\n\n")
-        optimized_context = []
-        current_length = 0
-        
-        for part in context_parts:
-            if "[페이지" in part and len(part) + current_length < max_context_length:
-                optimized_context.append(part)
-                current_length += len(part)
-        
-        # 최적화된 컨텍스트로 프롬프트 생성
-        optimized_context = "\n\n".join(optimized_context)
-        prompt = self.qa_prompt.format(question=query, context=optimized_context)
-        
-        # 모델별 파라미터 최적화
-        model_params = {
-            "gemma3:4b": {"temperature": 0.3, "top_p": 0.9, "num_predict": 1000},
-            "llama3.1:8b": {"temperature": 0.4, "top_p": 0.9, "num_predict": 800},
-            "gemma3:12b": {"temperature": 0.3, "top_p": 0.9, "num_predict": 1000}
-        }
-        
-        params = model_params.get(model, {"temperature": 0.1, "top_p": 0.1, "num_predict": 2048})
-        
-        # Ollama API를 통해 답변 생성
-        print(f"\n🤖 답변 생성 중... ({model})")
-        start_time = time.time()
-        try:
-            response = requests.post(
-                f"{OLLAMA_API_BASE}/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": params
-                }
-            )
-            response.raise_for_status()
-            answer = response.json().get("response", "")
-            elapsed_time = time.time() - start_time
-            print(f"✓ 답변 생성 완료: {model} ({elapsed_time:.2f}초)")
-            return {"answer": answer, "model": model}
-        except Exception as e:
-            logger.error(f"❌ 답변 생성 중 오류: {e}")
-            print(f"❌ 답변 생성 중 오류 발생: {e}")
-            return {"answer": f"답변 생성 중 오류가 발생했습니다: {str(e)}", "model": model}
 
 def main():
     # global 선언을 함수 시작 부분으로 이동
@@ -1274,7 +1203,7 @@ def main():
     
     print("\n" + "="*60)
     print("📊 한화손해보험 사업보고서 RAG 시스템")
-    print("(Gemma3:12b 모델)")
+    print("(Ollama 모델 비교: Llama3.1 vs Gemma3)")
     print("="*60)
     print("🔄 Ollama 서버 연결 확인 중...")
     
@@ -1560,6 +1489,68 @@ def main():
             logger.error(traceback.format_exc())
             print(f"❌ 치명적인 오류 발생: {e}")
             print("세부 오류 내용:", traceback.format_exc())
+
+    # format_context_for_model 메서드를 새롭게 추가
+    def format_context_for_model(self, docs: List[Document]) -> str:
+        """검색된 문서들을 모델에 전달할 수 있는 형식으로 변환"""
+        formatted_docs = []
+        for doc in docs:
+            page_info = f"[페이지 {doc.metadata.get('page', '불명')}]"
+            formatted_docs.append(f"{page_info} {doc.page_content}")
+        return "\n\n".join(formatted_docs)
+    
+    # answer 메서드를 새롭게 추가
+    def answer(self, query: str, model: str, context: str) -> Dict[str, Any]:
+        print(f"\n{'─'*60}")
+        print(f"📌 4단계: 답변 생성 ({model})")
+        print(f"{'─'*60}")
+        
+        # 컨텍스트 길이 제한 및 최적화
+        max_context_length = 2000  # 로컬 모델의 한계를 고려한 컨텍스트 길이
+        context_parts = context.split("\n\n")
+        optimized_context = []
+        current_length = 0
+        
+        for part in context_parts:
+            if "[페이지" in part and len(part) + current_length < max_context_length:
+                optimized_context.append(part)
+                current_length += len(part)
+        
+        # 최적화된 컨텍스트로 프롬프트 생성
+        optimized_context = "\n\n".join(optimized_context)
+        prompt = self.qa_prompt.format(question=query, context=optimized_context)
+        
+        # 모델별 파라미터 최적화
+        model_params = {
+            "gemma3:4b": {"temperature": 0.3, "top_p": 0.9, "num_predict": 1000},
+            "llama3.1:8b": {"temperature": 0.4, "top_p": 0.9, "num_predict": 800},
+            "gemma3:12b": {"temperature": 0.3, "top_p": 0.9, "num_predict": 1000}
+        }
+        
+        params = model_params.get(model, {"temperature": 0.1, "top_p": 0.1, "num_predict": 2048})
+        
+        # Ollama API를 통해 답변 생성
+        print(f"\n🤖 답변 생성 중... ({model})")
+        start_time = time.time()
+        try:
+            response = requests.post(
+                f"{OLLAMA_API_BASE}/generate",
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": params
+                }
+            )
+            response.raise_for_status()
+            answer = response.json().get("response", "")
+            elapsed_time = time.time() - start_time
+            print(f"✓ 답변 생성 완료: {model} ({elapsed_time:.2f}초)")
+            return {"answer": answer, "model": model}
+        except Exception as e:
+            logger.error(f"❌ 답변 생성 중 오류: {e}")
+            print(f"❌ 답변 생성 중 오류 발생: {e}")
+            return {"answer": f"답변 생성 중 오류가 발생했습니다: {str(e)}", "model": model}
 
 def streamlit_main():
     import streamlit as st
