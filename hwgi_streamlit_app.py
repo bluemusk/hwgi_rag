@@ -236,6 +236,9 @@ def process_question_with_file(question, pdf_path, chunk_size, chunk_overlap, to
         st.session_state.process_running = True
         st.session_state.raw_output = "쿼리 처리 시작 중...\n"
         
+        # 실시간 로그 표시를 위한 컨테이너 생성
+        log_placeholder = st.empty()
+        
         # 명령어 구성
         cmd = [
             "python3", "hwgi_rag_auto.py",
@@ -259,33 +262,66 @@ def process_question_with_file(question, pdf_path, chunk_size, chunk_overlap, to
         st.session_state.raw_output += f"실행 명령어: {cmd_str}\n\n"
         st.session_state.raw_output += "쿼리 실행 중...\n"
         
-        # 파일에서 질문 읽기 위한 입력 리디렉션 방식으로 변경
-        # 이렇게 하면 명령행 인수로 질문을 전달하지 않아 공백 문제를 피할 수 있음
+        # 실시간 로그 표시
+        log_placeholder.code(st.session_state.raw_output)
+        
+        # 프로세스 시작 (비동기 방식)
         with open(temp_file_path, 'r') as input_file:
-            result = subprocess.run(
+            # Popen을 사용하여 비동기로 프로세스 실행
+            process = subprocess.Popen(
                 cmd,
                 stdin=input_file,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=300
+                bufsize=1  # 라인 버퍼링
             )
             
-            # 디버깅을 위한 출력 (stderr가 있는 경우만)
-            if result.stderr:
-                print(f"하위 프로세스 오류 출력: {result.stderr}")
-                st.session_state.raw_output += f"\n오류 출력:\n{result.stderr}\n"
+            # 출력을 실시간으로 읽어오기 위한 함수
+            def read_output(pipe, is_error=False):
+                for line in iter(pipe.readline, ''):
+                    if line:
+                        # 세션 상태 업데이트
+                        st.session_state.raw_output += line
+                        # 실시간 로그 표시
+                        log_placeholder.code(st.session_state.raw_output)
+                        time.sleep(0.1)  # UI 업데이트 시간 제공
             
-            # 표준 출력 추가
-            if result.stdout:
-                st.session_state.raw_output += f"\n명령 출력:\n{result.stdout}\n"
+            # 표준 출력과 오류 출력을 별도의 스레드에서 읽음
+            stdout_thread = threading.Thread(target=read_output, args=(process.stdout,))
+            stderr_thread = threading.Thread(target=read_output, args=(process.stderr, True))
+            
+            stdout_thread.daemon = True
+            stderr_thread.daemon = True
+            
+            stdout_thread.start()
+            stderr_thread.start()
+            
+            # 프로세스 완료 대기
+            returncode = process.wait()
+            
+            # 스레드가 모든 출력을 읽을 때까지 기다림
+            stdout_thread.join()
+            stderr_thread.join()
             
             # 실행 완료 메시지 추가
-            if result.returncode == 0:
+            if returncode == 0:
                 st.session_state.raw_output += "\n✅ 프로세스 실행 완료\n"
             else:
-                st.session_state.raw_output += f"\n❌ 프로세스 실행 실패 (종료 코드: {result.returncode})\n"
-                
-        return result
+                st.session_state.raw_output += f"\n❌ 프로세스 실행 실패 (종료 코드: {returncode})\n"
+            
+            # 최종 로그 업데이트
+            log_placeholder.code(st.session_state.raw_output)
+            
+            # 결과 객체 생성
+            result = subprocess.CompletedProcess(
+                args=cmd,
+                returncode=returncode,
+                stdout=st.session_state.raw_output,
+                stderr=""  # stderr은 이미 stdout에 추가되었음
+            )
+            
+            return result
     finally:
         # 임시 파일 삭제
         if os.path.exists(temp_file_path):
@@ -346,6 +382,9 @@ with tab1:
     if not query_results_files or selected_result_file == "새 쿼리 입력":
         # 질문 입력
         question = st.text_area("질문을 입력하세요:", height=100, value=st.session_state.last_question)
+        
+        # 실시간 로그 표시 영역 (항상 위치 유지)
+        log_container = st.empty()
         
         if st.button("질문 제출", type="primary", disabled=(not selected_pdf)):
             if question:
@@ -441,11 +480,6 @@ with tab1:
                                     end_time=datetime.utcnow(),
                                     error=result.stderr
                                 )
-                        
-                        # 로그 표시
-                        # if result.stderr:
-                        #     st.error("오류 발생:")
-                        #     st.code(result.stderr)
                     
                     except subprocess.TimeoutExpired as e:
                         st.warning("실행 시간이 너무 깁니다. 프로세스가 계속 실행 중일 수 있습니다.")
@@ -506,20 +540,31 @@ with tab1:
             with st.expander(f"📝 모델: {model}", expanded=True):
                 st.markdown(answer)
     
-    # 로그 표시 영역 추가
-    if st.session_state.raw_output:
-        with st.expander("🔄 실행 로그", expanded=True):
-            st.code(st.session_state.raw_output)
-            
-    # 실행 중인 프로세스 확인
-    status_container = st.empty()
+    # 실행 중인 프로세스 확인과 실시간 로그 표시
     if 'process_running' not in st.session_state:
         st.session_state.process_running = False
     
     if st.session_state.process_running:
-        status_container.info("💬 쿼리 처리 중... 위 로그를 확인하세요.")
-    else:
-        status_container.empty()
+        # 진행 상태 표시
+        status_message = "💬 쿼리 처리 중... 아래 로그를 실시간으로 확인하세요."
+        st.info(status_message)
+        
+        # 실시간 로그 표시
+        log_container.markdown("### 🔄 실시간 로그")
+        log_display = log_container.code(st.session_state.raw_output)
+        
+        # 백그라운드에서 로그 업데이트
+        def update_log():
+            while st.session_state.process_running:
+                log_container.markdown("### 🔄 실시간 로그")
+                log_container.code(st.session_state.raw_output)
+                time.sleep(0.2)  # 업데이트 간격 (0.2초)
+        
+        # 로그 업데이트 스레드 시작
+        if not hasattr(st.session_state, 'log_thread') or not st.session_state.log_thread.is_alive():
+            st.session_state.log_thread = threading.Thread(target=update_log)
+            st.session_state.log_thread.daemon = True
+            st.session_state.log_thread.start()
 
 # 자동 테스트 탭
 with tab2:
@@ -529,10 +574,21 @@ with tab2:
     with col1:
         num_questions = st.number_input("생성할 질문 수", min_value=1, max_value=20, value=5)
     
+    # 실시간 로그 표시 영역 (항상 위치 유지)
+    test_log_container = st.empty()
+    
     if st.button("자동 테스트 실행", disabled=(not selected_pdf)):
         # LangSmith 추적을 위한 고유 ID 생성
         auto_test_run_id = str(uuid.uuid4())
         st.session_state.run_ids['auto_test'] = auto_test_run_id
+        
+        # 프로세스 실행 중 플래그 설정
+        st.session_state.process_running = True
+        st.session_state.auto_test_log = "자동 테스트 프로세스 시작 중...\n"
+        
+        # 실시간 로그 표시 초기화
+        test_log_container.markdown("### 🔄 자동 테스트 실시간 로그")
+        test_log_container.code(st.session_state.auto_test_log)
         
         # LangSmith 메타데이터 설정
         if langsmith_enabled:
@@ -566,15 +622,69 @@ with tab2:
         
         with st.spinner(f"{num_questions}개의 자동 테스트 질문 생성 및 평가 중..."):
             try:
-                result = subprocess.run(
+                # 디버깅 정보 추가
+                cmd_str = ' '.join(cmd)
+                st.session_state.auto_test_log += f"실행 명령어: {cmd_str}\n\n"
+                test_log_container.code(st.session_state.auto_test_log)
+                
+                # Popen을 사용하여 비동기로 프로세스 실행
+                process = subprocess.Popen(
                     cmd,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=600  # 자동 테스트는 더 긴 타임아웃 허용
+                    bufsize=1  # 라인 버퍼링
                 )
                 
-                # 로그 저장
-                st.session_state.auto_test_log = result.stdout
+                # 백그라운드에서 로그 업데이트
+                def update_test_log():
+                    while st.session_state.process_running:
+                        test_log_container.markdown("### 🔄 자동 테스트 실시간 로그")
+                        test_log_container.code(st.session_state.auto_test_log)
+                        time.sleep(0.2)  # 업데이트 간격
+                
+                # 로그 업데이트 스레드 시작
+                log_thread = threading.Thread(target=update_test_log)
+                log_thread.daemon = True
+                log_thread.start()
+                
+                # 출력을 실시간으로 읽어오기 위한 함수
+                def read_output(pipe, is_error=False):
+                    for line in iter(pipe.readline, ''):
+                        if line:
+                            # 세션 상태 업데이트
+                            st.session_state.auto_test_log += line
+                
+                # 표준 출력과 오류 출력을 별도의 스레드에서 읽음
+                stdout_thread = threading.Thread(target=read_output, args=(process.stdout,))
+                stderr_thread = threading.Thread(target=read_output, args=(process.stderr, True))
+                
+                stdout_thread.daemon = True
+                stderr_thread.daemon = True
+                
+                stdout_thread.start()
+                stderr_thread.start()
+                
+                # 프로세스 완료 대기
+                returncode = process.wait()
+                
+                # 스레드가 모든 출력을 읽을 때까지 기다림
+                stdout_thread.join()
+                stderr_thread.join()
+                log_thread.join(timeout=1.0)
+                
+                # 프로세스 종료 플래그 설정
+                st.session_state.process_running = False
+                
+                # 실행 완료 메시지 추가
+                if returncode == 0:
+                    st.session_state.auto_test_log += "\n✅ 자동 테스트 실행 완료\n"
+                else:
+                    st.session_state.auto_test_log += f"\n❌ 자동 테스트 실행 실패 (종료 코드: {returncode})\n"
+                
+                # 최종 로그 업데이트
+                test_log_container.markdown("### 🔄 자동 테스트 로그")
+                test_log_container.code(st.session_state.auto_test_log)
                 
                 # 가장 최근 자동 테스트 결과 파일 찾기
                 auto_test_files = glob.glob("auto_test_results_*.json")
@@ -590,20 +700,6 @@ with tab2:
                             outputs={"results": st.session_state.auto_test_results},
                             end_time=datetime.utcnow(),
                             error=None
-                        )
-                
-                # 로그 표시
-                if result.stderr:
-                    st.error("오류 발생:")
-                    st.code(result.stderr)
-                    
-                    # LangSmith에 오류 기록
-                    if langsmith_enabled:
-                        langsmith_client.update_run(
-                            run_id=auto_test_run_id,
-                            outputs=None,
-                            end_time=datetime.utcnow(),
-                            error=result.stderr
                         )
             
             except subprocess.TimeoutExpired as e:
